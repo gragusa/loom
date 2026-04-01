@@ -1,0 +1,53 @@
+// loom.typ — ergonomic single-entrypoint API for Loom
+//
+// Import this instead of juggling julia.typ, r.typ, and _loom_data.typ.
+
+#import "julia.typ": jlrun as _jlrun, jlconsole as _jlconsole, jlcode as _jlcode, jlfig as _jlfig, jlmarginfig as _jlmarginfig, jlwidefig as _jlwidefig, jltable as _jltable, jlexpr as _jlexpr, jli as _jli, jl-set-root, jl-set-code-size, jl-set-prompt-size, jl-set-prompt, jl-set-block, jl-set-output-color, loom-set-caption, loom-no-margin, loom-set-font
+#import "r.typ": rrun as _rrun, rconsole as _rconsole, rcode as _rcode, rfig as _rfig, rmarginfig as _rmarginfig, rwidefig as _rwidefig, rtable as _rtable, rexpr as _rexpr, ri as _ri, r-set-code-size, r-set-prompt-size, r-set-prompt, r-set-block
+#import "_loom_data.typ": _loom, _loom_style
+
+#let jlrun(id: none, session: none, ..args, body) = _jlrun(id: id, session: session, body)
+#let rrun(id: none, session: none, message: true, warning: true, ..args, body) = _rrun(id: id, session: session, message: message, warning: warning, body)
+
+#let jlconsole(id: none, ..args, body) = _jlconsole(id: id, data: _loom, style: _loom_style, body)
+#let rconsole(id: none, ..args, body) = _rconsole(id: id, data: _loom, style: _loom_style, body)
+
+#let jlcode(id: none, ..args, body) = _jlcode(id: id, data: _loom, style: _loom_style, body)
+#let rcode(id: none, ..args, body) = _rcode(id: id, data: _loom, style: _loom_style, body)
+
+#let jlfig(id, caption: none, dy: 0pt, width: 100%, label: none) = _jlfig(id, caption: caption, dy: dy, width: width, label: label, data: _loom)
+#let jlmarginfig(id, caption: none, dy: 0pt, label: none) = _jlmarginfig(id, caption: caption, dy: dy, label: label, data: _loom)
+#let jlwidefig(id, caption: none, dy: 0pt, label: none) = _jlwidefig(id, caption: caption, dy: dy, label: label, data: _loom)
+
+#let rfig(id, caption: none, dy: 0pt, width: 100%, label: none) = _rfig(id, caption: caption, dy: dy, width: width, label: label, data: _loom)
+#let rmarginfig(id, caption: none, dy: 0pt, label: none) = _rmarginfig(id, caption: caption, dy: dy, label: label, data: _loom)
+#let rwidefig(id, caption: none, dy: 0pt, label: none) = _rwidefig(id, caption: caption, dy: dy, label: label, data: _loom)
+
+#let jltable(id: none, caption: none, dy: 0pt, ..args, body) = _jltable(id: id, caption: caption, dy: dy, data: _loom, body)
+#let rtable(id: none, caption: none, dy: 0pt, ..args, body) = _rtable(id: id, caption: caption, dy: dy, data: _loom, body)
+
+#let jlexpr(id: none, label: none, ..args, body) = _jlexpr(id: id, label: label, data: _loom, body)
+#let rexpr(id: none, label: none, ..args, body) = _rexpr(id: id, label: label, data: _loom, body)
+
+#let jli(code) = _jli(code, data: _loom)
+#let ri(code) = _ri(code, data: _loom)
+
+#let jlplot(id: none, caption: none, dy: 0pt, width: 100%, place: "body", label: none, ..args, body) = {
+  if place == "margin" {
+    _jlmarginfig(id, caption: caption, dy: dy, label: label, data: _loom)
+  } else if place == "wide" {
+    _jlwidefig(id, caption: caption, dy: dy, label: label, data: _loom)
+  } else {
+    _jlfig(id, caption: caption, dy: dy, width: width, label: label, data: _loom)
+  }
+}
+
+#let rplot(id: none, caption: none, dy: 0pt, width: 100%, place: "body", label: none, ..args, body) = {
+  if place == "margin" {
+    _rmarginfig(id, caption: caption, dy: dy, label: label, data: _loom)
+  } else if place == "wide" {
+    _rwidefig(id, caption: caption, dy: dy, label: label, data: _loom)
+  } else {
+    _rfig(id, caption: caption, dy: dy, width: width, label: label, data: _loom)
+  }
+}

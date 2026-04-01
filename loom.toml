@@ -1,0 +1,45 @@
+# loom.toml — per-project configuration
+#
+# All fields are optional. Uncomment and change only what you need.
+# The values shown are the defaults.
+
+# Language runtimes
+# julia = "julia"
+# julia_port = 2159
+# r = "Rscript"
+# r_port = 2160
+# prestart_all_languages = false    # Start both daemons even before cells appear
+
+# Output
+# cache_dir = ".loom/_loom_cache"
+# data_file = ".loom/_loom_data.typ"
+
+# Default figure dimensions (inches)
+
+# fig_width = 7
+# fig_height = 5
+
+# Daemon idle timeout in seconds (0 = no timeout). Default: 1800 (30 min).
+# Daemons shut down automatically after this many seconds without a request.
+# idle_timeout = 1800
+
+# Typst style settings.
+# Values are raw Typst expressions.
+
+[style]
+# jl_code_size = "10pt"                 # Julia console font size
+# jl_prompt_size = "10pt"               # Julia console prompt font size
+# jl_prompt_text = "\"julia> \""        # Julia console prompt text
+# r_code_size = "10pt"                  # R console font size
+# r_prompt_size = "10pt"                # R console prompt font size
+# r_prompt_text = "\"r> \""             # R console prompt text
+# output_color = "luma(100)"            # Console output text color
+# block_fill = "luma(248)"              # Console block background
+# block_inset = "8pt"                   # Console block padding
+# block_radius = "2pt"                  # Console block corner radius
+# block_stroke = "0.5pt + luma(220)"    # Console block border
+# line_spacing = "0.55em"               # Line spacing in console blocks
+# caption_size = "12pt"                 # Caption font size
+# caption_dy = "1.75em"                 # Caption vertical offset (margin mode)
+# caption_gap = "1em"                   # Gap between figure and caption (inline mode)
+# font = "DejaVu Sans Mono"             # Monospace font for all console blocks
