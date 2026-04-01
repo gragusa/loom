@@ -14,6 +14,13 @@ use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::path::Path;
 
+/// Summary of a run for concise output.
+#[derive(Default)]
+pub struct RunSummary {
+    pub cells_executed: usize,
+    pub cells_skipped: usize,
+}
+
 /// Holds the daemon clients for each supported language.
 pub struct Clients {
     pub julia: Option<DaemonClient>,
@@ -51,11 +58,11 @@ pub async fn run_chapter(
     _cache_root: &Path,
     clients: &Clients,
     force: bool,
-) -> Result<()> {
+) -> Result<RunSummary> {
     let cells = book.chapter_cells(chapter);
     if cells.is_empty() {
         log::debug!("Chapter '{}' has no cells.", chapter);
-        return Ok(());
+        return Ok(RunSummary::default());
     }
 
     let first_stale = if force {
@@ -66,7 +73,10 @@ pub async fn run_chapter(
 
     let Some(start) = first_stale else {
         log::info!("Chapter '{}': all {} cells fresh.", chapter, cells.len());
-        return Ok(());
+        return Ok(RunSummary {
+            cells_executed: 0,
+            cells_skipped: cells.len(),
+        });
     };
 
     log::info!(
@@ -115,7 +125,11 @@ pub async fn run_chapter(
     }
 
     log::info!("Chapter '{}': done.", chapter);
-    Ok(())
+    let executed = cells.len() - start;
+    Ok(RunSummary {
+        cells_executed: executed,
+        cells_skipped: start,
+    })
 }
 
 /// Run the preamble first, then all other chapters.
@@ -126,22 +140,28 @@ pub async fn run_all(
     clients: &Clients,
     force: bool,
     data_file: &Path,
-) -> Result<()> {
+) -> Result<RunSummary> {
+    let mut total = RunSummary::default();
+
     if book.chapters.contains(&"preamble".to_string()) {
-        run_chapter("preamble", book, cache, cache_root, clients, force).await?;
+        let s = run_chapter("preamble", book, cache, cache_root, clients, force).await?;
+        total.cells_executed += s.cells_executed;
+        total.cells_skipped += s.cells_skipped;
     }
 
     for chapter in &book.chapters {
         if chapter == "preamble" {
             continue;
         }
-        run_chapter(chapter, book, cache, cache_root, clients, force).await?;
+        let s = run_chapter(chapter, book, cache, cache_root, clients, force).await?;
+        total.cells_executed += s.cells_executed;
+        total.cells_skipped += s.cells_skipped;
     }
 
     codegen::write_cache_typ(cache_root, book, cache)?;
     codegen::write_style_typ(&clients.style, data_file.parent().unwrap_or(Path::new(".")))?;
     codegen::write_data_typ(data_file, cache_root)?;
-    Ok(())
+    Ok(total)
 }
 
 /// Run only chapters whose source files include `changed_path`.
@@ -164,7 +184,7 @@ pub async fn run_affected(
     }
 
     if directly_changed.contains("preamble") {
-        log::info!("Preamble changed — re-running all chapters.");
+        println!("Preamble changed — re-running all chapters.");
         run_all(book, cache, cache_root, clients, false, data_file).await?;
         return Ok(true);
     }

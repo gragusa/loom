@@ -23,6 +23,10 @@ For R, install the required packages once:
 install.packages(c("jsonlite", "httpuv"))
 ```
 
+For Julia, Loom needs `JSON3` in the active project. If `loom run` or `loom watch`
+does not find it, Loom will prompt to either create a local environment and add
+`JSON3`, or add `JSON3` to the existing environment in the current directory.
+
 ## Quick start
 
 ```sh
@@ -46,10 +50,13 @@ loom watch book.typ
 
 Loom is usable today for both Julia and R workflows, and the recent ergonomics pass improved the default authoring model substantially:
 
-- `loom init` now writes a single-entrypoint [`loom.typ`] interface alongside the lower-level support files.
-- The recommended Typst setup is now just `#import "loom.typ": *`.
+- `loom init` now writes a single-entrypoint [`loom.typ`] interface and lower-level support files into the `.loom/` directory.
+- The recommended Typst setup is now just `#import ".loom/loom.typ": *`.
 - Inline plot cells are supported via `#jlplot(...)` and `#rplot(...)`, so the common case no longer requires a manual `savefig` call plus a separate `jlfig`/`rfig` render step.
 - `loom run` auto-manages daemons for one-off runs and no longer leaves them running by default after the command exits.
+- Runtime startup is language-aware by default: Loom starts only the daemons the current document needs, unless you opt into eager startup with `prestart_all_languages = true`.
+- Execution is now fail-fast: daemon transport errors, reset/replay failures, and cell execution errors cause `loom run` to exit non-zero instead of silently leaving stale cache output in place.
+- Shared `session:` overrides are replayed deterministically from earlier chapters, so re-running a chapter no longer depends on leftover daemon state.
 - The legacy low-level API (`jlrun`, `rrun`, `jlfig`, `rfig`, explicit `jlpp_savefig` / `loom_savefig`) remains supported for advanced workflows.
 
 Current recommendation:
@@ -88,8 +95,8 @@ The low-level API (`jlrun`/`rrun` + `loom_savefig` + manual `#figure(image(...))
                        |                  |
                        <------------------'
                        |
-                  writes _loom_cache/_loom_cache.typ
-                  writes _loom_data.typ
+                  writes .loom/_loom_cache/_loom_cache.typ
+                  writes .loom/_loom_data.typ
                        |
                        v
                   typst compile ──> book.pdf
@@ -105,18 +112,39 @@ Create a `loom.toml` in your project root. All fields are optional:
 # Language runtimes
 julia = "julia"          # Path to Julia binary
 julia_port = 2159        # TCP port for Julia daemon
-r = "Rscript"            # Path to R binary (omit to disable R)
+r = "Rscript"            # Path to R binary
 r_port = 2160            # HTTP port for R daemon
+prestart_all_languages = false  # Start both configured daemons even before cells appear
 
 # Output
-cache_dir = "_loom_cache"     # Directory for cached cell outputs
-data_file = "_loom_data.typ"  # Generated Typst data file
+cache_dir = ".loom/_loom_cache"     # Directory for cached cell outputs
+data_file = ".loom/_loom_data.typ"  # Generated Typst data file
 
 # Default figure dimensions (inches)
 # Applied when a chunk doesn't specify fig-width / fig-height
 fig_width = 7
 fig_height = 5
+
+[style]
+jl_code_size = "10pt"                 # Julia console code font size
+jl_prompt_size = "10pt"               # Julia console prompt font size
+jl_prompt_text = "\"julia> \""        # Julia console prompt text
+r_code_size = "10pt"                  # R console code font size
+r_prompt_size = "10pt"                # R console prompt font size
+r_prompt_text = "\"r> \""             # R console prompt text
+output_color = "luma(100)"            # Console output text color
+block_fill = "luma(248)"              # Console block background
+block_inset = "8pt"                   # Console block padding
+block_radius = "2pt"                  # Console block corner radius
+block_stroke = "0.5pt + luma(220)"    # Console block border
+line_spacing = "0.55em"               # Line spacing in console blocks
+font = "DejaVu Sans Mono"            # Monospace font for all console blocks
+caption_size = "12pt"                 # Caption font size
+caption_dy = "1.75em"                 # Caption vertical offset (margin mode)
+caption_gap = "1em"                   # Gap between figure and caption (inline mode)
 ```
+
+All `[style]` values are raw Typst expressions. They are passed directly to the rendering functions via a style dictionary — no state updates needed.
 
 **Priority chain:** chunk option > `loom.toml` value > hardcoded default.
 
@@ -133,10 +161,11 @@ Execute code cells and generate output files.
 | `--cache-dir DIR` | from config | Cache directory |
 | `-f, --force` | off | Ignore cache, re-execute everything |
 | `--port PORT` | from config | Julia daemon TCP port |
+| `--idle-timeout SECS` | 1800 | Daemon idle timeout (0 to disable) |
 
 ### `loom watch [ROOT]`
 
-Watch `.typ` sources for changes and re-run only affected chapters. Designed for use alongside Tinymist live preview.
+Watch `.typ` sources for changes and re-run only affected chapters. Designed for use alongside Tinymist live preview. Accepts the same `--cache-dir`, `--port`, and `--idle-timeout` flags.
 
 ### `loom list [ROOT]`
 
@@ -155,7 +184,7 @@ Stop daemons. Without flags, stops the daemon on the configured Julia port. Use 
 ### Julia
 
 ```typst
-#import "loom.typ": *
+#import ".loom/loom.typ": *
 
 // Silent execution (no visible output)
 #jlrun(id: "setup", ```julia
@@ -185,7 +214,7 @@ Table(df)
 ### R
 
 ```typst
-#import "loom.typ": *
+#import ".loom/loom.typ": *
 
 // Silent execution (with optional message/warning filtering)
 #rrun(id: "setup", message: false, warning: false, ```r
@@ -193,7 +222,7 @@ library(ggplot2)
 df <- mtcars
 ```)
 
-// Console with R> prompts
+// Console with r> prompts
 #rconsole(id: "demo", ```r
 summary(df$mpg)
 cor(df$mpg, df$wt)
@@ -256,6 +285,8 @@ loom_savefig(plot_object, "name", fmt = "svg", width = 7, height = 5)
 
 Both helpers read default dimensions from `fig-width`/`fig-height` chunk options or `loom.toml` settings. You can override per-call.
 
+Console prompt text and size can be configured in `loom.toml` under `[style]`. The Typst setters (`#jl-set-prompt`, `#r-set-prompt`, `#jl-set-prompt-size`, `#r-set-prompt-size`) remain available for manual overrides in the document preamble.
+
 ## Document structure
 
 ### Multi-file book
@@ -268,8 +299,13 @@ my-book/
   chapter/
     intro.typ          # Chapter "intro"
     analysis.typ       # Chapter "analysis"
-  _loom_cache/         # Generated by loom
-  _loom_data.typ       # Generated by loom
+  .loom/               # Generated by loom
+    loom.typ
+    julia.typ
+    r.typ
+    _loom_data.typ
+    _loom_style.typ
+    _loom_cache/
 ```
 
 Each `#include` from the root file defines a chapter. A file named `preamble.typ` is special: its cells run first and are replayed into every chapter's session.
@@ -282,8 +318,7 @@ Loom also works with a single `.typ` file — all cells belong to one chapter na
 my-paper/
   paper.typ           # All cells inline
   loom.toml
-  _loom_cache/
-  _loom_data.typ
+  .loom/              # Generated by loom
 ```
 
 ### Setting up imports
@@ -291,10 +326,10 @@ my-paper/
 Preferred setup:
 
 ```typst
-#import "loom.typ": *
+#import ".loom/loom.typ": *
 ```
 
-Legacy low-level imports via `julia.typ`, `r.typ`, and `_loom_data.typ` still work.
+Legacy low-level imports via `.loom/julia.typ`, `.loom/r.typ`, and `.loom/_loom_data.typ` still work.
 
 ## Session model
 
@@ -303,24 +338,28 @@ Legacy low-level imports via `julia.typ`, `r.typ`, and `_loom_data.typ` still wo
 - The **preamble** session runs before all others; its code is replayed into fresh sessions after a reset.
 - Julia and R cells can coexist in the same chapter — they run in separate per-language sessions.
 - Use `session: "name"` to override the default session assignment.
+- Shared `session:` names are reconstructed from preamble plus earlier chapters that use the same session, in document order.
 
 ## Caching
 
 Loom caches cell results using content-addressable hashing (SHA-256 of the cell code). On subsequent runs, cells whose code hasn't changed are skipped. Use `--force` to re-execute everything.
 
+If a run fails, Loom now stops immediately and leaves the previous cache/data files untouched rather than silently mixing fresh and stale results.
+
 Cache structure:
 
 ```
-_loom_cache/
-  preamble/
-    manifest.json
-    figures/
-  intro/
-    manifest.json
-    figures/
-      sincos.svg
-      histogram.svg
-  _loom_cache.typ      # Consolidated Typst data
+.loom/
+  _loom_cache/
+    preamble/
+      manifest.json
+      figures/
+    intro/
+      manifest.json
+      figures/
+        sincos.svg
+        histogram.svg
+    _loom_cache.typ    # Consolidated Typst data
 ```
 
 ## Live preview

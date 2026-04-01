@@ -8,7 +8,6 @@ use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 pub async fn watch_loop(root: PathBuf, config: Config) -> Result<()> {
-    log::info!("Watching {} for changes — Ctrl-C to stop.", root.display());
 
     let initial_book = parser::parse_book(&root)?;
 
@@ -86,7 +85,7 @@ pub async fn watch_loop(root: PathBuf, config: Config) -> Result<()> {
 
     // Initial full run.
     {
-        log::info!("Initial run…");
+        println!("Initial run…");
         let book = initial_book;
         let mut cache = cache::BookCache::load(&cache_dir, &book)?;
         if let Err(e) =
@@ -116,7 +115,7 @@ pub async fn watch_loop(root: PathBuf, config: Config) -> Result<()> {
             }
         }
 
-        log::info!(
+        println!(
             "{} file(s) changed: {}",
             changed.len(),
             changed

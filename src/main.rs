@@ -51,6 +51,10 @@ enum Command {
         /// Daemon idle timeout in seconds (0 = no timeout). Default: 1800 (30 min).
         #[arg(long)]
         idle_timeout: Option<u64>,
+
+        /// Show detailed progress (daemon startup, per-chapter status, file writes).
+        #[arg(long, short)]
+        verbose: bool,
     },
 
     /// Watch Typst sources; re-run only the chapter(s) that changed.
@@ -69,6 +73,10 @@ enum Command {
         /// Daemon idle timeout in seconds (0 = no timeout). Default: 1800 (30 min).
         #[arg(long)]
         idle_timeout: Option<u64>,
+
+        /// Show detailed progress (daemon startup, per-chapter status, file writes).
+        #[arg(long, short)]
+        verbose: bool,
     },
 
     /// List chapters and their cell counts (no execution).
@@ -103,9 +111,17 @@ enum DaemonAction {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
     let cli = Cli::parse();
+
+    // Determine log level: --verbose (or RUST_LOG override) → info; default → warn.
+    let verbose = match &cli.command {
+        Command::Run { verbose, .. } => *verbose,
+        Command::Watch { verbose, .. } => *verbose,
+        _ => false,
+    };
+    let default_level = if verbose { "info" } else { "warn" };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
+        .init();
 
     match cli.command {
         Command::Init => {
@@ -119,6 +135,7 @@ async fn main() -> Result<()> {
             force,
             port,
             idle_timeout,
+            verbose: _,
         } => {
             // Auto-write julia.typ and r.typ if they don't exist.
             write_typst_files_if_missing()?;
@@ -126,17 +143,19 @@ async fn main() -> Result<()> {
             let book = parser::parse_book(&root)?;
 
             // Spawn daemons for languages actually used in the book.
+            let mut daemons_started: Vec<&str> = Vec::new();
+
             let jl_client =
                 if cfg.prestart_all_languages || book.uses_language(parser::Language::Julia) {
-                    Some(
-                        daemon::DaemonClient::connect_or_spawn(
-                            cfg.julia_port,
-                            &cfg.julia,
-                            parser::Language::Julia,
-                            cfg.idle_timeout,
-                        )
-                        .await?,
+                    let client = daemon::DaemonClient::connect_or_spawn(
+                        cfg.julia_port,
+                        &cfg.julia,
+                        parser::Language::Julia,
+                        cfg.idle_timeout,
                     )
+                    .await?;
+                    daemons_started.push("Julia");
+                    Some(client)
                 } else {
                     None
                 };
@@ -144,18 +163,26 @@ async fn main() -> Result<()> {
             let r_client = if cfg.prestart_all_languages || book.uses_language(parser::Language::R)
             {
                 let r_cmd = cfg.r.as_deref().unwrap_or("Rscript");
-                Some(
-                    daemon::DaemonClient::connect_or_spawn(
-                        cfg.r_port,
-                        r_cmd,
-                        parser::Language::R,
-                        cfg.idle_timeout,
-                    )
-                    .await?,
+                let client = daemon::DaemonClient::connect_or_spawn(
+                    cfg.r_port,
+                    r_cmd,
+                    parser::Language::R,
+                    cfg.idle_timeout,
                 )
+                .await?;
+                daemons_started.push("R");
+                Some(client)
             } else {
                 None
             };
+
+            if !daemons_started.is_empty() {
+                println!(
+                    "{} daemon{} ready.",
+                    daemons_started.join(" and "),
+                    if daemons_started.len() > 1 { "s" } else { "" }
+                );
+            }
 
             let clients = runner::Clients {
                 julia: jl_client,
@@ -166,7 +193,7 @@ async fn main() -> Result<()> {
             };
             let mut cache = cache::BookCache::load(&cfg.cache_dir, &book)?;
 
-            match chapter {
+            let summary = match chapter {
                 Some(ch) => {
                     if !book.chapters.contains(&ch) {
                         anyhow::bail!(
@@ -175,8 +202,9 @@ async fn main() -> Result<()> {
                             book.chapters.join(", ")
                         );
                     }
+                    let mut total = runner::RunSummary::default();
                     if book.chapters.contains(&"preamble".to_string()) && ch != "preamble" {
-                        runner::run_chapter(
+                        let s = runner::run_chapter(
                             "preamble",
                             &book,
                             &mut cache,
@@ -185,15 +213,22 @@ async fn main() -> Result<()> {
                             force,
                         )
                         .await?;
+                        total.cells_executed += s.cells_executed;
+                        total.cells_skipped += s.cells_skipped;
                     }
-                    runner::run_chapter(&ch, &book, &mut cache, &cfg.cache_dir, &clients, force)
-                        .await?;
+                    let s = runner::run_chapter(
+                        &ch, &book, &mut cache, &cfg.cache_dir, &clients, force,
+                    )
+                    .await?;
+                    total.cells_executed += s.cells_executed;
+                    total.cells_skipped += s.cells_skipped;
                     codegen::write_cache_typ(&cfg.cache_dir, &book, &cache)?;
                     codegen::write_style_typ(
                         &cfg.style,
                         cfg.data_file.parent().unwrap_or(std::path::Path::new(".")),
                     )?;
                     codegen::write_data_typ(&cfg.data_file, &cfg.cache_dir)?;
+                    total
                 }
                 None => {
                     runner::run_all(
@@ -204,9 +239,9 @@ async fn main() -> Result<()> {
                         force,
                         &cfg.data_file,
                     )
-                    .await?;
+                    .await?
                 }
-            }
+            };
 
             // Always write style and data files (even if all cells were fresh),
             // so changes to loom.toml [style] take effect without --force.
@@ -216,7 +251,17 @@ async fn main() -> Result<()> {
             )?;
             codegen::write_data_typ(&cfg.data_file, &cfg.cache_dir)?;
 
-            log::info!("Done.");
+            let total = summary.cells_executed + summary.cells_skipped;
+            if summary.cells_executed == 0 {
+                println!("Done — all {} cells fresh.", total);
+            } else {
+                println!(
+                    "Done — {} cell{} executed, {} cached.",
+                    summary.cells_executed,
+                    if summary.cells_executed == 1 { "" } else { "s" },
+                    summary.cells_skipped,
+                );
+            }
         }
 
         Command::Watch {
@@ -224,9 +269,20 @@ async fn main() -> Result<()> {
             cache_dir,
             port,
             idle_timeout,
+            verbose: _,
         } => {
             write_typst_files_if_missing()?;
             let cfg = config::Config::load(port, cache_dir.as_deref(), idle_timeout)?;
+            let timeout_desc = if cfg.idle_timeout == 0 {
+                "no timeout".to_string()
+            } else {
+                format!("{}m idle timeout", cfg.idle_timeout / 60)
+            };
+            println!(
+                "Watching {} for changes ({}) — Ctrl-C to stop.",
+                root.display(),
+                timeout_desc,
+            );
             watcher::watch_loop(root, cfg).await?;
         }
 

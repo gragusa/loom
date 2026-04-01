@@ -365,6 +365,7 @@ pub async fn spawn_daemon(
                 })?;
         }
         Language::R => {
+            ensure_r_environment(cmd).await?;
             Command::new(cmd)
                 .arg("--no-save")
                 .arg("--no-restore")
@@ -462,6 +463,122 @@ async fn install_julia_package(cmd: &str, package: &str, has_project: bool) -> R
 
     if !status.success() {
         anyhow::bail!("Julia package installation failed for `{package}`");
+    }
+
+    Ok(())
+}
+
+async fn ensure_r_environment(cmd: &str) -> Result<()> {
+    let required: &[&str] = &["jsonlite", "httpuv"];
+
+    let mut missing = Vec::new();
+    for &pkg in required {
+        if !r_package_available(cmd, pkg).await? {
+            missing.push(pkg);
+        }
+    }
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let use_renv = Path::new("renv.lock").exists();
+    let missing_list = missing.join(", ");
+
+    if use_renv {
+        if !r_package_available(cmd, "renv").await? {
+            anyhow::bail!(
+                "An renv.lock file was found but the `renv` package is not installed. \
+                 Run `Rscript -e 'install.packages(\"renv\"); renv::restore()'` first."
+            );
+        }
+    }
+
+    let prompt = if use_renv {
+        format!(
+            "Loom needs R packages [{missing_list}] but they are not available. \
+             An renv environment was detected. Install via renv::install()? [Y/n]: "
+        )
+    } else {
+        format!(
+            "Loom needs R packages [{missing_list}] but they are not installed. \
+             Install via install.packages()? [Y/n]: "
+        )
+    };
+
+    if !prompt_yes_no(&prompt)? {
+        anyhow::bail!(
+            "R environment is missing Loom dependencies: {missing_list}. \
+             Install them manually and retry."
+        );
+    }
+
+    install_r_packages(cmd, &missing, use_renv).await?;
+
+    let mut still_missing = Vec::new();
+    for &pkg in &missing {
+        if !r_package_available(cmd, pkg).await? {
+            still_missing.push(pkg);
+        }
+    }
+
+    if !still_missing.is_empty() {
+        anyhow::bail!(
+            "R package installation completed, but these packages are still \
+             not available: {}",
+            still_missing.join(", ")
+        );
+    }
+
+    Ok(())
+}
+
+async fn r_package_available(cmd: &str, package: &str) -> Result<bool> {
+    let status = Command::new(cmd)
+        .arg("--no-save")
+        .arg("--no-restore")
+        .arg("-e")
+        .arg(format!(
+            "if (!requireNamespace(\"{package}\", quietly = TRUE)) quit(status = 1)"
+        ))
+        .status()
+        .await
+        .with_context(|| format!("Failed to probe R package `{package}`"))?;
+
+    Ok(status.success())
+}
+
+async fn install_r_packages(cmd: &str, packages: &[&str], use_renv: bool) -> Result<()> {
+    let pkg_vec = packages
+        .iter()
+        .map(|p| format!("\"{}\"", p))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let script = if use_renv {
+        format!("renv::install(c({pkg_vec}))")
+    } else {
+        format!(
+            "install.packages(c({pkg_vec}), repos = \"https://cloud.r-project.org\")"
+        )
+    };
+
+    let status = Command::new(cmd)
+        .arg("--no-save")
+        .arg("--no-restore")
+        .arg("-e")
+        .arg(&script)
+        .status()
+        .await
+        .with_context(|| {
+            format!("Failed to install R packages: {}", packages.join(", "))
+        })?;
+
+    if !status.success() {
+        anyhow::bail!(
+            "R package installation failed for: {}",
+            packages.join(", ")
+        );
     }
 
     Ok(())
