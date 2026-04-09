@@ -87,60 +87,110 @@
 /// Caption styling (shared by all figure/table/margin captions).
 #let loom-caption-size = state("loom-caption-size", 12pt)
 #let loom-caption-dy = state("loom-caption-dy", 1.75em)
-/// Gap between figure and inline caption (when margin is off).
+/// Gap between figure/table and inline caption.
 #let loom-caption-gap = state("loom-caption-gap", 1em)
 
-/// Whether to use margin captions (true) or inline captions below the figure (false).
-/// Set to false for slides or documents without a margin column.
+/// Caption position: "margin", "top", or "bottom".
+/// - "margin": caption in the margin via marginalia (default)
+/// - "top": caption above the figure/table (inline)
+/// - "bottom": caption below the figure/table (inline)
+#let loom-caption-position = state("loom-caption-position", "margin")
+
+/// Backward-compatible alias: true → "margin", false → "top".
 #let loom-use-margin = state("loom-use-margin", true)
 
 /// Set caption appearance globally.
-#let loom-set-caption(size: none, dy: none, margin: none, gap: none) = {
+/// `position` accepts "margin", "top", or "bottom".
+/// `margin` (bool) is kept for backward compatibility: true → "margin", false → "top".
+#let loom-set-caption(size: none, dy: none, margin: none, gap: none, position: none) = {
   if size != none { loom-caption-size.update(size) }
   if dy != none { loom-caption-dy.update(dy) }
-  if margin != none { loom-use-margin.update(margin) }
   if gap != none { loom-caption-gap.update(gap) }
+  if position != none {
+    loom-caption-position.update(position)
+    loom-use-margin.update(position == "margin")
+  }
+  if margin != none {
+    loom-use-margin.update(margin)
+    loom-caption-position.update(if margin { "margin" } else { "top" })
+  }
 }
 
 /// Disable margin captions (for slides or documents without margins).
 /// Call once in your preamble: `#loom-no-margin`
-#let loom-no-margin = loom-use-margin.update(false)
+/// Captions will appear above figures and tables.
+#let loom-no-margin = {
+  loom-use-margin.update(false)
+  loom-caption-position.update("top")
+}
 
 /// Silent code execution — renders nothing in the document.
 #let jlrun(id: none, session: none, body) = {
   // jlrun cells are invisible; they only exist for the preprocessor.
 }
 
-/// Helper: emit a numbered caption — in the margin or inline depending on `loom-use-margin`.
+/// Helper: emit a numbered caption at the configured position.
+/// Position is read from `loom-caption-position`: "margin", "top", or "bottom".
+/// When called from figure/table functions, this emits only the caption content.
+/// The caller is responsible for placing it before or after the main content
+/// (see `_caption-above` and `_caption-below`).
+#let _caption-content(counter-obj, label, caption) = {
+  context {
+    let cap-sz = loom-caption-size.get()
+    let ch = counter(heading).get().first()
+    let n = counter-obj.get().first()
+    align(left)[
+      #text(weight: "bold", size: cap-sz)[#label #ch.#n. ]
+      #text(size: cap-sz, style: "italic", caption)
+    ]
+  }
+}
+
+/// Emit caption in margin mode.
+#let _margin-caption-note(counter-obj, label, caption, dy) = {
+  context {
+    let cap-dy = loom-caption-dy.get()
+    let cap-sz = loom-caption-size.get()
+    marginalia.note(numbering: none, alignment: "top", dy: cap-dy + dy)[
+      #context {
+        let ch = counter(heading).get().first()
+        let n = counter-obj.get().first()
+        text(weight: "bold", size: cap-sz)[#label #ch.#n. ]
+        text(size: cap-sz, style: "italic", caption)
+      }
+    ]
+  }
+}
+
+/// Emit caption above the content (with gap after).
+#let _caption-above(counter-obj, label, caption) = {
+  _caption-content(counter-obj, label, caption)
+  context { v(loom-caption-gap.get()) }
+}
+
+/// Emit caption below the content (with gap before).
+#let _caption-below(counter-obj, label, caption) = {
+  context { v(loom-caption-gap.get()) }
+  _caption-content(counter-obj, label, caption)
+}
+
+/// Backward-compatible wrapper: dispatches to margin, top, or bottom.
 #let _margin-caption(counter-obj, label, caption, dy) = {
   context {
-    let use-margin = loom-use-margin.get()
-    let cap-sz = loom-caption-size.get()
-    if use-margin {
-      let cap-dy = loom-caption-dy.get()
-      marginalia.note(numbering: none, alignment: "top", dy: cap-dy + dy)[
-        #context {
-          let ch = counter(heading).get().first()
-          let n = counter-obj.get().first()
-          text(weight: "bold", size: cap-sz)[#label #ch.#n. ]
-          text(size: cap-sz, style: "italic", caption)
-        }
-      ]
+    let pos = loom-caption-position.get()
+    if pos == "margin" {
+      _margin-caption-note(counter-obj, label, caption, dy)
+    } else if pos == "top" {
+      _caption-above(counter-obj, label, caption)
     } else {
-      // Inline caption below the figure.
-      let gap = loom-caption-gap.get()
-      v(gap)
-      let ch = counter(heading).get().first()
-      let n = counter-obj.get().first()
-      text(weight: "bold", size: cap-sz)[#label #ch.#n. ]
-      text(size: cap-sz, style: "italic", caption)
+      _caption-below(counter-obj, label, caption)
     }
   }
 }
 
 /// Table from Julia output — renders raw Typst markup captured via
 /// `show(io, MIME"text/typst", result)` (e.g. from SummaryTables.jl).
-/// Caption goes in the margin, numbered as chapter.n.
+/// Caption position is controlled by `loom-caption-position`.
 /// Use `dy` to adjust the vertical position of the caption.
 #let jltable(id: none, caption: none, dy: 0pt, data: (:), body) = {
   let cell = data.at(id, default: none)
@@ -149,8 +199,19 @@
     if typst-code.len() > 0 {
       figure(kind: "loom-table", supplement: "Table", caption: none, numbering: "1", {
         _jl-table-counter.step()
-        if caption != none { _margin-caption(_jl-table-counter, "Table", caption, dy) }
+        context {
+          let pos = loom-caption-position.get()
+          if caption != none and (pos == "margin" or pos == "top") {
+            _margin-caption(_jl-table-counter, "Table", caption, dy)
+          }
+        }
         eval(typst-code, mode: "markup")
+        context {
+          let pos = loom-caption-position.get()
+          if caption != none and pos == "bottom" {
+            _margin-caption(_jl-table-counter, "Table", caption, dy)
+          }
+        }
       })
     }
   }
@@ -379,7 +440,7 @@
 }
 
 /// Figure from Julia output — image at body width.
-/// Caption goes in the margin (if enabled) or below the figure (inline mode).
+/// Caption position is controlled by `loom-caption-position`: "margin", "top", or "bottom".
 /// Use `width` to scale the displayed image (e.g. `width: 80%` or `width: 300pt`).
 #let jlfig(id, caption: none, dy: 0pt, width: 100%, label: none, data: (:)) = {
   let cell = data.at(id, default: none)
@@ -389,14 +450,16 @@
       let fig = figure(kind: "loom-fig", supplement: "Figure", caption: none, numbering: "1", {
         _jl-fig-counter.step()
         context {
-          if loom-use-margin.get() {
-            if caption != none { _margin-caption(_jl-fig-counter, "Figure", caption, dy) }
+          let pos = loom-caption-position.get()
+          if caption != none and (pos == "margin" or pos == "top") {
+            _margin-caption(_jl-fig-counter, "Figure", caption, dy)
           }
         }
         context { image(_jl-root.get() + figs.at(0), width: width) }
         context {
-          if not loom-use-margin.get() {
-            if caption != none { _margin-caption(_jl-fig-counter, "Figure", caption, dy) }
+          let pos = loom-caption-position.get()
+          if caption != none and pos == "bottom" {
+            _margin-caption(_jl-fig-counter, "Figure", caption, dy)
           }
         }
       })
@@ -444,11 +507,22 @@
       let fig = figure(kind: "loom-fig", supplement: "Figure", caption: none, numbering: "1", {
         _jl-fig-counter.step()
         context {
+          let pos = loom-caption-position.get()
+          if caption != none and pos == "top" {
+            _margin-caption(_jl-fig-counter, "Figure", caption, dy)
+          }
+        }
+        context {
           marginalia.wideblock(side: "outer")[
             #image(_jl-root.get() + figs.at(0), width: 100%)
           ]
         }
-        if caption != none { _margin-caption(_jl-fig-counter, "Figure", caption, dy) }
+        context {
+          let pos = loom-caption-position.get()
+          if caption != none and (pos == "margin" or pos == "bottom") {
+            _margin-caption(_jl-fig-counter, "Figure", caption, dy)
+          }
+        }
       })
       if label != none { [#fig #label] } else { fig }
     }

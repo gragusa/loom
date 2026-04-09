@@ -6,7 +6,7 @@
 #import "@preview/marginalia:0.3.1" as marginalia
 
 /// Reuse the shared counters and helpers from julia.typ.
-#import "julia.typ": _jl-fig-counter, _jl-table-counter, _margin-caption, _jl-root, jl-output-color, loom-caption-dy, loom-caption-size, loom-caption-gap, loom-use-margin, loom-font, _s
+#import "julia.typ": _jl-fig-counter, _jl-table-counter, _margin-caption, _jl-root, jl-output-color, loom-caption-dy, loom-caption-size, loom-caption-gap, loom-use-margin, loom-caption-position, loom-font, _s
 
 /// Font size for R console blocks (configurable, independent from Julia).
 #let r-code-size = state("r-code-size", 10pt)
@@ -169,7 +169,7 @@
   }
 }
 
-/// R figure — body width. Caption in margin or below (depending on loom-use-margin).
+/// R figure — body width. Caption position controlled by `loom-caption-position`.
 /// Use `width` to scale the displayed image (e.g. `width: 60%`).
 #let rfig(id, caption: none, dy: 0pt, width: 100%, label: none, data: (:)) = {
   let cell = data.at(id, default: none)
@@ -179,14 +179,16 @@
       let fig = figure(kind: "loom-fig", supplement: "Figure", caption: none, numbering: "1", {
         _jl-fig-counter.step()
         context {
-          if loom-use-margin.get() {
-            if caption != none { _margin-caption(_jl-fig-counter, "Figure", caption, dy) }
+          let pos = loom-caption-position.get()
+          if caption != none and (pos == "margin" or pos == "top") {
+            _margin-caption(_jl-fig-counter, "Figure", caption, dy)
           }
         }
         context { image(_jl-root.get() + figs.at(0), width: width) }
         context {
-          if not loom-use-margin.get() {
-            if caption != none { _margin-caption(_jl-fig-counter, "Figure", caption, dy) }
+          let pos = loom-caption-position.get()
+          if caption != none and pos == "bottom" {
+            _margin-caption(_jl-fig-counter, "Figure", caption, dy)
           }
         }
       })
@@ -246,11 +248,22 @@
       let fig = figure(kind: "loom-fig", supplement: "Figure", caption: none, numbering: "1", {
         _jl-fig-counter.step()
         context {
+          let pos = loom-caption-position.get()
+          if caption != none and pos == "top" {
+            _margin-caption(_jl-fig-counter, "Figure", caption, dy)
+          }
+        }
+        context {
           marginalia.wideblock(side: "outer")[
             #image(_jl-root.get() + figs.at(0), width: 100%)
           ]
         }
-        if caption != none { _margin-caption(_jl-fig-counter, "Figure", caption, dy) }
+        context {
+          let pos = loom-caption-position.get()
+          if caption != none and (pos == "margin" or pos == "bottom") {
+            _margin-caption(_jl-fig-counter, "Figure", caption, dy)
+          }
+        }
       })
       if label != none { [#fig #label] } else { fig }
     }
@@ -258,6 +271,7 @@
 }
 
 /// R table — renders Typst markup from as_typst() / gt output.
+/// Caption position is controlled by `loom-caption-position`.
 #let rtable(id: none, caption: none, dy: 0pt, data: (:), ..args, body) = {
   let cell = data.at(id, default: none)
   if cell != none {
@@ -265,8 +279,19 @@
     if typst-code.len() > 0 {
       figure(kind: "loom-table", supplement: "Table", caption: none, numbering: "1", {
         _jl-table-counter.step()
-        if caption != none { _margin-caption(_jl-table-counter, "Table", caption, dy) }
+        context {
+          let pos = loom-caption-position.get()
+          if caption != none and (pos == "margin" or pos == "top") {
+            _margin-caption(_jl-table-counter, "Table", caption, dy)
+          }
+        }
         eval(typst-code, mode: "markup")
+        context {
+          let pos = loom-caption-position.get()
+          if caption != none and pos == "bottom" {
+            _margin-caption(_jl-table-counter, "Table", caption, dy)
+          }
+        }
       })
     }
   }
