@@ -2,7 +2,7 @@
 //
 // Import this instead of juggling julia.typ, r.typ, and _loom_data.typ.
 
-#import "julia.typ": jlrun as _jlrun, jlconsole as _jlconsole, jlcode as _jlcode, jlfig as _jlfig, jlmarginfig as _jlmarginfig, jlwidefig as _jlwidefig, jltable as _jltable, jlexpr as _jlexpr, jli as _jli, jl-set-root, jl-set-code-size, jl-set-prompt-size, jl-set-prompt, jl-set-block, jl-set-output-color, loom-set-caption, loom-no-margin, loom-set-font
+#import "julia.typ": jlrun as _jlrun, jlconsole as _jlconsole, jlcode as _jlcode, jlfig as _jlfig, jlmarginfig as _jlmarginfig, jlwidefig as _jlwidefig, jltable as _jltable, jlexpr as _jlexpr, jli as _jli, jl-set-root, jl-set-code-size, jl-set-prompt-size, jl-set-prompt, jl-set-block, jl-set-output-color, loom-set-caption, loom-no-margin, loom-set-font, loom-set-labels, loom-table-label, loom-figure-label
 #import "r.typ": rrun as _rrun, rconsole as _rconsole, rcode as _rcode, rfig as _rfig, rmarginfig as _rmarginfig, rwidefig as _rwidefig, rtable as _rtable, rexpr as _rexpr, ri as _ri, r-set-code-size, r-set-prompt-size, r-set-prompt, r-set-block
 #import "_loom_data.typ": _loom, _loom_style
 

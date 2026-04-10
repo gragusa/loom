@@ -6,7 +6,7 @@
 #import "@preview/marginalia:0.3.1" as marginalia
 
 /// Reuse the shared counters and helpers from julia.typ.
-#import "julia.typ": _jl-fig-counter, _jl-table-counter, _margin-caption, _jl-root, jl-output-color, loom-caption-dy, loom-caption-size, loom-caption-gap, loom-use-margin, loom-caption-position, loom-font, _s
+#import "julia.typ": _jl-fig-counter, _jl-table-counter, _margin-caption, _jl-root, jl-output-color, loom-caption-dy, loom-caption-size, loom-caption-gap, loom-use-margin, loom-caption-position, loom-font, _s, loom-table-label, loom-figure-label
 
 /// Font size for R console blocks (configurable, independent from Julia).
 #let r-code-size = state("r-code-size", 10pt)
@@ -181,14 +181,14 @@
         context {
           let pos = loom-caption-position.get()
           if caption != none and (pos == "margin" or pos == "top") {
-            _margin-caption(_jl-fig-counter, "Figure", caption, dy)
+            { let fig-lbl = loom-figure-label.get(); _margin-caption(_jl-fig-counter, fig-lbl, caption, dy) }
           }
         }
         context { image(_jl-root.get() + figs.at(0), width: width) }
         context {
           let pos = loom-caption-position.get()
           if caption != none and pos == "bottom" {
-            _margin-caption(_jl-fig-counter, "Figure", caption, dy)
+            { let fig-lbl = loom-figure-label.get(); _margin-caption(_jl-fig-counter, fig-lbl, caption, dy) }
           }
         }
       })
@@ -227,7 +227,8 @@
               context {
                 let ch = counter(heading).get().first()
                 let n = _jl-fig-counter.get().first()
-                text(weight: "bold", size: cap-sz)[Figure #ch.#n. ]
+                let fig-lbl = loom-figure-label.get()
+                text(weight: "bold", size: cap-sz)[#fig-lbl #ch.#n. ]
                 text(size: cap-sz, style: "italic", caption)
               }
             }
@@ -250,7 +251,7 @@
         context {
           let pos = loom-caption-position.get()
           if caption != none and pos == "top" {
-            _margin-caption(_jl-fig-counter, "Figure", caption, dy)
+            { let fig-lbl = loom-figure-label.get(); _margin-caption(_jl-fig-counter, fig-lbl, caption, dy) }
           }
         }
         context {
@@ -261,7 +262,7 @@
         context {
           let pos = loom-caption-position.get()
           if caption != none and (pos == "margin" or pos == "bottom") {
-            _margin-caption(_jl-fig-counter, "Figure", caption, dy)
+            { let fig-lbl = loom-figure-label.get(); _margin-caption(_jl-fig-counter, fig-lbl, caption, dy) }
           }
         }
       })
@@ -282,14 +283,14 @@
         context {
           let pos = loom-caption-position.get()
           if caption != none and (pos == "margin" or pos == "top") {
-            _margin-caption(_jl-table-counter, "Table", caption, dy)
+            { let tbl-lbl = loom-table-label.get(); _margin-caption(_jl-table-counter, tbl-lbl, caption, dy) }
           }
         }
         eval(typst-code, mode: "markup")
         context {
           let pos = loom-caption-position.get()
           if caption != none and pos == "bottom" {
-            _margin-caption(_jl-table-counter, "Table", caption, dy)
+            { let tbl-lbl = loom-table-label.get(); _margin-caption(_jl-table-counter, tbl-lbl, caption, dy) }
           }
         }
       })
