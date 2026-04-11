@@ -273,12 +273,12 @@
 
 /// R table — renders Typst markup from as_typst() / gt output.
 /// Caption position is controlled by `loom-caption-position`.
-#let rtable(id: none, caption: none, dy: 0pt, data: (:), ..args, body) = {
+#let rtable(id: none, caption: none, dy: 0pt, label: none, data: (:), ..args, body) = {
   let cell = data.at(id, default: none)
   if cell != none {
     let typst-code = cell.at("typst_output", default: "")
     if typst-code.len() > 0 {
-      figure(kind: "loom-table", supplement: "Table", caption: none, numbering: "1", {
+      let tbl = figure(kind: "loom-table", supplement: "Table", caption: none, numbering: "1", {
         _jl-table-counter.step()
         context {
           let pos = loom-caption-position.get()
@@ -294,6 +294,7 @@
           }
         }
       })
+      if label != none { [#tbl #label] } else { tbl }
     }
   }
 }

@@ -23,8 +23,8 @@
 #let rmarginfig(id, caption: none, dy: 0pt, label: none) = _rmarginfig(id, caption: caption, dy: dy, label: label, data: _loom)
 #let rwidefig(id, caption: none, dy: 0pt, label: none) = _rwidefig(id, caption: caption, dy: dy, label: label, data: _loom)
 
-#let jltable(id: none, caption: none, dy: 0pt, ..args, body) = _jltable(id: id, caption: caption, dy: dy, data: _loom, body)
-#let rtable(id: none, caption: none, dy: 0pt, ..args, body) = _rtable(id: id, caption: caption, dy: dy, data: _loom, body)
+#let jltable(id: none, caption: none, dy: 0pt, label: none, ..args, body) = _jltable(id: id, caption: caption, dy: dy, label: label, data: _loom, body)
+#let rtable(id: none, caption: none, dy: 0pt, label: none, ..args, body) = _rtable(id: id, caption: caption, dy: dy, label: label, data: _loom, body)
 
 #let jlexpr(id: none, label: none, ..args, body) = _jlexpr(id: id, label: label, data: _loom, body)
 #let rexpr(id: none, label: none, ..args, body) = _rexpr(id: id, label: label, data: _loom, body)

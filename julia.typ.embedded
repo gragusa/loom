@@ -203,14 +203,14 @@
 /// `show(io, MIME"text/typst", result)` (e.g. from SummaryTables.jl).
 /// Caption position is controlled by `loom-caption-position`.
 /// Use `dy` to adjust the vertical position of the caption.
-#let jltable(id: none, caption: none, dy: 0pt, data: (:), body) = {
+#let jltable(id: none, caption: none, dy: 0pt, label: none, data: (:), body) = {
   let cell = data.at(id, default: none)
   if cell != none {
     let typst-code = cell.at("typst_output", default: "")
     if typst-code.len() > 0 {
       context {
       let tbl-lbl = loom-table-label.get()
-      figure(kind: "loom-table", supplement: tbl-lbl, caption: none, numbering: "1", {
+      let tbl = figure(kind: "loom-table", supplement: tbl-lbl, caption: none, numbering: "1", {
         _jl-table-counter.step()
         context {
           let pos = loom-caption-position.get()
@@ -228,6 +228,7 @@
           }
         }
       })
+      if label != none { [#tbl #label] } else { tbl }
       }
     }
   }
