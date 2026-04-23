@@ -4,4 +4,6 @@ fn main() {
     println!("cargo:rerun-if-changed=loom.typ.embedded");
     println!("cargo:rerun-if-changed=julia.typ.embedded");
     println!("cargo:rerun-if-changed=r.typ.embedded");
+    println!("cargo:rerun-if-changed=r-daemon.R");
+    println!("cargo:rerun-if-changed=julia-daemon.jl");
 }

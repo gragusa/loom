@@ -339,7 +339,7 @@ fn parse_cells(src: &str, path: &Path, default_chapter: &str) -> Result<Vec<Cell
                     );
                 }
                 let trimmed = lines[i].trim();
-                if trimmed == "```)" || trimmed == "```" {
+                if is_closing_fence(trimmed) {
                     break;
                 }
                 code_lines.push(lines[i]);
@@ -403,6 +403,18 @@ fn parse_cells(src: &str, path: &Path, default_chapter: &str) -> Result<Vec<Cell
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Recognize a code fence's closing line.
+///
+/// The line (already trimmed by the caller) must start with the three-backtick
+/// fence.  Anything after the fence — Typst call punctuation (`)`, `,`), a
+/// trailing label like `<fig-foo>`, a comment, etc. — is ignored.  This is
+/// safe because a literal triple-backtick never appears at the start of a
+/// line inside real Julia or R code: backticks in both languages are only
+/// used for quoted identifiers, always paired and inline.
+fn is_closing_fence(trimmed: &str) -> bool {
+    trimmed.starts_with("```")
+}
 
 fn parse_includes(src: &str) -> Vec<String> {
     let re = regex::Regex::new(r#"#include\s*(?:\(\s*"([^"]+)"\s*\)|"([^"]+)")"#).unwrap();

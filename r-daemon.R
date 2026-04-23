@@ -138,8 +138,10 @@ run_with_capture <- function(code_str, env, opts) {
 run_console <- function(code_str, env, opts) {
   statements <- list()
   env$.loom_figures <- character(0)
+  first_error <- NULL
 
   exprs <- tryCatch(parse(text = code_str, keep.source = TRUE), error = function(e) {
+    first_error <<- conditionMessage(e)
     statements[[1]] <<- list(
       code = jsonlite::unbox(code_str),
       output = jsonlite::unbox(paste0("Error: ", conditionMessage(e)))
@@ -148,7 +150,8 @@ run_console <- function(code_str, env, opts) {
   })
 
   if (is.null(exprs)) {
-    return(list(statements = statements, stderr = "", figures = character(0), error = NULL))
+    return(list(statements = statements, stderr = "", figures = character(0),
+                error = first_error))
   }
 
   src_refs <- attr(exprs, "srcref")
@@ -189,6 +192,7 @@ run_console <- function(code_str, env, opts) {
     output <- ""
     if (!is.null(expr_error)) {
       output <- paste0("Error: ", expr_error)
+      if (is.null(first_error)) first_error <- expr_error
     } else if (nzchar(captured)) {
       output <- captured
     }
@@ -199,7 +203,8 @@ run_console <- function(code_str, env, opts) {
     )
   }
 
-  list(statements = statements, stderr = "", figures = env$.loom_figures, error = NULL)
+  list(statements = statements, stderr = "", figures = env$.loom_figures,
+       error = first_error)
 }
 
 # ── Table mode ──────────────────────────────────────────────────────────────
