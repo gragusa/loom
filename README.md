@@ -1,6 +1,25 @@
-# Loom
+# loom
 
-A code preprocessor for Typst that weaves Julia and R output into documents. Write code directly in `.typ` source files, and loom executes it through persistent daemons, caches the results, and generates a data file your document imports. Typst never runs code — it just typesets pre-computed results.
+loom executes Julia, R, and Python code written in Typst documents and lets
+Typst typeset the results. Code cells are ordinary Typst code blocks with
+Quarto-style options. loom runs them in persistent kernels, stores the
+results under `.loom/`, and a small Typst library renders them. Typst itself
+never runs code, so the document compiles at any time and Tinymist's live
+preview keeps working while you write.
+
+````typst
+#import ".loom/loom.typ": loom
+#show: loom
+
+```julia
+#| label: fig-sine
+#| fig-cap: A sine wave on $[0, 2 pi]$.
+using Plots
+plot(sin, 0, 2π; label = "")
+```
+
+@fig-sine shows one period; its maximum is `{julia} maximum(sin.(0:0.01:2π))`.
+````
 
 ## Install
 
@@ -8,427 +27,210 @@ A code preprocessor for Typst that weaves Julia and R output into documents. Wri
 cargo install --path .
 ```
 
-The binary is self-contained: both daemon scripts (Julia and R) are embedded and extracted to a temp directory at runtime.
+The `loom` binary contains the kernels and the Typst library; `loom` writes
+them into the project when needed.
 
-## Prerequisites
+Requirements:
 
-- **Typst** 0.13+
-- **Julia** 1.10+ (if using Julia cells)
-- **R** 4.0+ with `jsonlite` and `httpuv` packages (if using R cells)
-- **Rust** 1.85+ (to build from source)
-
-For R, install the required packages once:
-
-```r
-install.packages(c("jsonlite", "httpuv"))
-```
-
-For Julia, Loom needs `JSON3` in the active project. If `loom run` or `loom watch`
-does not find it, Loom will prompt to either create a local environment and add
-`JSON3`, or add `JSON3` to the existing environment in the current directory.
+- Typst 0.15. loom locates cells with the parser of Typst 0.15, and the Typst
+  library must agree with it on the text of each code block.
+- Julia 1.10 or later, for Julia cells. No packages are required in your
+  environment.
+- R 4.0 or later with `jsonlite` and `evaluate`, for R cells. `svglite` is
+  used for SVG figures when installed.
+- Python 3.9 or later, for Python cells. Figures need matplotlib.
 
 ## Quick start
 
 ```sh
-# Initialize support files once
-loom init
-
-# Execute all code cells (starts daemons automatically)
-loom run book.typ
-
-# Compile the PDF
-typst compile book.typ
-
-# For live preview, keep daemons around only while watching
-loom watch book.typ
+loom init                 # writes .loom/loom.typ, .loom/cells.json, loom.toml
+loom run paper.typ        # executes the cells
+typst compile paper.typ   # or open paper.typ with Tinymist
 ```
 
-## Status
+For live preview, run `loom watch paper.typ` in a terminal and open the file
+in an editor with Tinymist. Each time you save, loom executes what changed and
+the preview updates.
 
-Loom provides a complete authoring workflow for both Julia and R in Typst documents:
+`loom render paper.typ` runs the cells and then compiles in strict mode, where
+any cell without a current result is an error. Use it for the final PDF.
 
-- **Single import**: `#import ".loom/loom.typ": *` is all you need — no manual imports of `julia.typ`, `r.typ`, or `_loom_data.typ`.
-- **Inline plots**: `#jlplot(...)` and `#rplot(...)` execute code, capture the figure, and render it in one call.
-- **Cross-references**: all figure helpers accept `label:` so figures are referenceable via `@label` without manual Typst wrappers.
-- **Placement control**: `place: "body"` (default), `"margin"`, or `"wide"` on plot cells.
-- **Daemon lifecycle**: `loom run` auto-starts and auto-stops daemons. By default, Loom starts only the runtimes used by the current document; set `prestart_all_languages = true` to keep both configured daemons warm. Idle daemons shut down after 30 minutes (configurable).
-- **Caching**: content-addressable hashing skips unchanged cells on subsequent runs.
-- **Fail-fast execution**: transport failures, reset failures, and cell errors now stop `loom run` instead of silently reusing stale cache output.
+## Cells
 
-The legacy low-level API (`jlrun`, `rrun`, `jlfig`, `rfig`, explicit `jlpp_savefig` / `loom_savefig`) remains supported for advanced workflows like multi-figure cells or composite layouts.
+A fenced raw block whose language tag is `julia`, `r`, or `python` is a cell.
+Options go at the top, one per line, as `#| key: value`:
 
-## Author API
-
-All functions are available after `#import ".loom/loom.typ": *`.
-
-| Function | Purpose |
-|----------|---------|
-| `#jlrun(id, ...)` | Silent Julia execution (no output in document) |
-| `#rrun(id, ...)` | Silent R execution |
-| `#jlconsole(id, ...)` | Julia code with `julia>` prompts and interleaved output |
-| `#rconsole(id, ...)` | R code with `r>` prompts and interleaved output |
-| `#jlplot(id, ...)` | Julia figure: execute + capture + render |
-| `#rplot(id, ...)` | R figure: execute + capture + render |
-| `#jltable(id, ...)` | Julia table (SummaryTables.jl etc.) |
-| `#rtable(id, ...)` | R table (tinytable, gt) |
-
-### Plot cell parameters
-
-```typst
-#rplot(
-  id: "fig-scatter",          // required: cell identifier
-  caption: [A scatter plot.],  // optional: figure caption
-  label: <fig-scatter>,        // optional: Typst label for @fig-scatter
-  place: "body",               // optional: "body" (default), "margin", or "wide"
-  width: 80%,                  // optional: image width (body placement only)
-  dy: 0pt,                     // optional: vertical caption offset
-  fig-width: 7,                // optional: R/Julia figure width in inches
-  fig-height: 5,               // optional: R/Julia figure height in inches
-  ```r
-  library(ggplot2)
-  ggplot(mtcars, aes(wt, mpg)) + geom_point()
-  ```
-)
-```
-
-The low-level figure helpers (`jlfig`, `rfig`, `jlmarginfig`, `rmarginfig`, `jlwidefig`, `rwidefig`) accept the same `label:`, `caption:`, `dy:`, and `width:` parameters.
-
-Console prompt text and size can be configured in `loom.toml` under `[style]`. The Typst setters (`#jl-set-prompt`, `#r-set-prompt`, `#jl-set-prompt-size`, `#r-set-prompt-size`) remain available for manual overrides in the document preamble.
-
-## Cross-references
-
-Pass `label:` to any figure helper to make it referenceable:
-
-```typst
-#rplot(
-  id: "fig-crime",
-  label: <fig-crime>,
-  caption: [Crime vs. police presence per 100k inhabitants.],
-  width: 72%,
-  ```r
-  ggplot(crime_plot, aes(x = police_rate, y = crime_rate)) +
-    geom_point(color = "darkblue", size = 2.5)
-  ```
-)
-
-As shown in @fig-crime, the correlation is positive but misleading.
-```
-
-This works for all placement modes (`"body"`, `"margin"`, `"wide"`) and both languages. No manual `#figure(image(...)) <label>` wrapper is needed.
-
-## How it works
-
-```
-  .typ sources ──> loom (Rust) ──> Julia daemon (TCP, port 2159)
-                       |           R daemon (HTTP, port 2160)
-                       |                  |
-                       |           executes cells,
-                       |           captures stdout/stderr,
-                       |           saves figures
-                       |                  |
-                       <------------------'
-                       |
-                  writes .loom/_loom_cache/_loom_cache.typ
-                  writes .loom/_loom_data.typ
-                       |
-                       v
-                  typst compile ──> book.pdf
-```
-
-Loom is language-agnostic at the protocol level. Julia uses a TCP daemon with newline-delimited JSON; R uses an HTTP daemon (httpuv) with JSON POST requests. Both speak the same logical protocol.
-
-## Configuration
-
-Create a `loom.toml` in your project root. All fields are optional:
-
-```toml
-# Language runtimes
-julia = "julia"          # Path to Julia binary
-julia_port = 2159        # TCP port for Julia daemon
-r = "Rscript"            # Path to R binary
-r_port = 2160            # HTTP port for R daemon
-prestart_all_languages = false  # Start both configured daemons even before cells appear
-
-# Output
-cache_dir = ".loom/_loom_cache"     # Directory for cached cell outputs
-data_file = ".loom/_loom_data.typ"  # Generated Typst data file
-
-# Default figure dimensions (inches)
-fig_width = 7
-fig_height = 5
-
-# Daemon idle timeout in seconds (0 = no timeout)
-idle_timeout = 1800           # Default: 30 minutes
-
-[style]
-jl_code_size = "10pt"                 # Julia console code font size
-jl_prompt_size = "10pt"               # Julia console prompt font size
-jl_prompt_text = "\"julia> \""        # Julia console prompt text
-r_code_size = "10pt"                  # R console code font size
-r_prompt_size = "10pt"                # R console prompt font size
-r_prompt_text = "\"r> \""             # R console prompt text
-output_color = "luma(100)"            # Console output text color
-block_fill = "luma(248)"              # Console block background
-block_inset = "8pt"                   # Console block padding
-block_radius = "2pt"                  # Console block corner radius
-block_stroke = "0.5pt + luma(220)"    # Console block border
-line_spacing = "0.55em"               # Line spacing in console blocks
-font = "DejaVu Sans Mono"            # Monospace font for all console blocks
-caption_size = "12pt"                 # Caption font size
-caption_dy = "1.75em"                 # Caption vertical offset (margin mode)
-caption_gap = "1em"                   # Gap between figure and caption (inline mode)
-```
-
-All `[style]` values are raw Typst expressions passed directly to rendering functions.
-
-**Priority chain:** CLI flag > chunk option > `loom.toml` value > hardcoded default.
-
-## CLI reference
-
-### `loom run [ROOT]`
-
-Execute code cells and generate output files.
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `ROOT` | `book.typ` | Root Typst file |
-| `-c, --chapter NAME` | all | Re-run only this chapter |
-| `--cache-dir DIR` | from config | Cache directory |
-| `-f, --force` | off | Ignore cache, re-execute everything |
-| `--port PORT` | from config | Julia daemon TCP port |
-| `--idle-timeout SECS` | 1800 | Daemon idle timeout (0 to disable) |
-
-### `loom watch [ROOT]`
-
-Watch `.typ` sources for changes and re-run only affected chapters. Designed for use alongside Tinymist live preview. Accepts the same `--cache-dir`, `--port`, and `--idle-timeout` flags.
-
-### `loom list [ROOT]`
-
-Show chapters, cell counts, and languages used (no execution).
-
-### `loom daemon list`
-
-Show all running loom daemons (port and PID).
-
-### `loom daemon stop [--port PORT] [--all]`
-
-Stop daemons. Without flags, stops the daemon on the configured Julia port. Use `--all` to stop every running loom daemon.
-
-## Cell syntax
-
-### Julia
-
-```typst
-#import ".loom/loom.typ": *
-
-// Silent execution (no visible output)
-#jlrun(id: "setup", ```julia
-using Statistics
-x = randn(100)
-```)
-
-// Console with julia> prompts and interleaved output
-#jlconsole(id: "demo", ```julia
-mean(x)
-std(x)
-```)
-
-// Inline plot — execute, capture, and render in one call
-#jlplot(id: "fig-hist",
-  caption: [Distribution of 1000 draws from N(0,1).],
-  label: <fig-hist>,
-  place: "margin",
-  ```julia
-  using Plots
-  histogram(randn(1000); bins = 30, label = "")
-  ```)
-
-See @fig-hist for the result.
-
-// Table (captures MIME"text/typst" from SummaryTables.jl etc.)
-#jltable(id: "tbl-id", caption: [Results.], ```julia
-using SummaryTables
-Table(df)
-```)
-```
-
-### R
-
-```typst
-#import ".loom/loom.typ": *
-
-// Silent execution (with optional message/warning filtering)
-#rrun(id: "setup", message: false, warning: false, ```r
-library(ggplot2)
-df <- mtcars
-```)
-
-// Console with r> prompts
-#rconsole(id: "demo", ```r
-summary(df$mpg)
-cor(df$mpg, df$wt)
-```)
-
-// Inline plot with cross-reference
-#rplot(id: "fig-scatter",
-  caption: [Weight vs. fuel economy.],
-  label: <fig-scatter>,
-  width: 80%,
-  ```r
-  ggplot(df, aes(wt, mpg)) +
-    geom_point() +
-    labs(x = "Weight (1000 lbs)", y = "Miles per gallon")
-  ```)
-
-@fig-scatter shows a clear negative relationship.
-
-// Table (tinytable or gt)
-#rtable(id: "tbl-id", caption: [Coefficients.], ```r
-library(tinytable)
-tt(coef_df)
-```)
-```
-
-### Chunk options
-
-Parsed from the cell header. These control the daemon's behavior:
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `message` | `true` | Include R `message()` output |
-| `warning` | `true` | Include R `warning()` output |
-| `error` | `true` | Include errors in output |
-| `echo` | `true` | Show source code |
-| `eval` | `true` | Execute the code |
-| `results` | `"markup"` | Output mode: `markup`, `asis`, `hold`, `hide` |
-| `fig-width` | from config | Figure width in inches |
-| `fig-height` | from config | Figure height in inches |
-| `comment` | `"##"` | Prefix for R output lines |
-| `collapse` | `false` | Merge code and output |
-
-### Saving figures (advanced)
-
-For the default flow, prefer `#jlplot` / `#rplot` — just return the plot object from the code block.
-
-Manual save helpers are available for advanced workflows such as multiple figures from one cell or explicit artifact naming. Inside `#jlrun` / `#rrun` cells:
-
-**Julia:**
-```julia
-jlpp_savefig(plot_object, "name"; fmt=:svg, width=7, height=5)
-```
-
-**R:**
+````typst
 ```r
-loom_savefig(plot_object, "name", fmt = "svg", width = 7, height = 5)
+#| echo: false
+#| fig-width: 6
+library(ggplot2)
+ggplot(mtcars, aes(wt, mpg)) + geom_point()
 ```
+````
 
-Both helpers read default dimensions from `fig-width`/`fig-height` chunk options or `loom.toml` settings.
+Inline code is written as `` `{julia} expr` ``, `` `{r} expr` ``, or
+`` `{python} expr` ``; the result replaces it in the text.
 
-## Document structure
+A code block with `#| eval: false` is shown but not executed. Code blocks in
+other languages are left alone.
 
-### Multi-file book
+### What a cell shows
 
-```
-my-book/
-  book.typ            # Root: imports + includes
-  loom.toml           # Configuration
-  preamble.typ        # Shared session (loaded into all chapters)
-  chapter/
-    intro.typ          # Chapter "intro"
-    analysis.typ       # Chapter "analysis"
-  .loom/               # Generated by loom
-    loom.typ
-    julia.typ
-    r.typ
-    _loom_data.typ
-    _loom_style.typ
-    _loom_cache/
-```
+Each statement's code is followed by its output: printed text, warnings and
+messages, plots, and the value of the cell.
 
-Each `#include` from the root file defines a chapter. A file named `preamble.typ` is special: its cells run first and are replayed into every chapter's session.
+- Julia and Python show the value of the last statement, as Jupyter does. A
+  trailing `;` hides it. With `prompt: true` the cell is shown as a REPL
+  session, and the value of every statement appears.
+- R shows every visible value, as knitr does.
+- A value that can be shown as an image (a Plots.jl or Makie figure, a ggplot,
+  a matplotlib figure) becomes a figure. Several plots in one cell become one
+  figure with several images.
+- A value with a Typst representation becomes Typst content: in Julia,
+  `show(io, MIME"text/typst"(), x)` (SummaryTables.jl); in R, tinytable
+  objects, gt objects if the installed gt has `as_typst()`, or your own
+  `loom_typst()` method; in Python, `_repr_typst_()`.
 
-### Single-file document
+### Options
 
-Loom also works with a single `.typ` file — all cells belong to one chapter named after the file:
+Options marked *exec* change what the kernel computes: changing one re-executes
+the cell. The others only change how the stored result is drawn, so editing
+them updates the preview immediately.
 
-```
-my-paper/
-  paper.typ           # All cells inline
-  loom.toml
-  .loom/              # Generated by loom
-```
+| Option | | Default | Meaning |
+|---|---|---|---|
+| `eval` | | `true` | execute the cell |
+| `session` | exec | the chapter | name of the session the cell runs in |
+| `setup` | exec | `false` | run this cell at the start of every session of its language |
+| `error` | exec | `false` | an error is expected output instead of a failure |
+| `fig-width`, `fig-height` | exec | 7, 5 | figure size in inches |
+| `fig-format` | exec | `svg` | `svg`, `png`, or `pdf` |
+| `fig-dpi` | exec | 300 | resolution of raster figures |
+| `echo` | | `true` | show the code |
+| `output` | | `true` | `false` hides the output; `asis` treats it as Typst markup |
+| `include` | | `true` | `false` hides code and output (the cell still runs) |
+| `warning`, `message` | | `true` | show warnings, messages |
+| `prompt` | | `false` | REPL style, with `julia>`, `>`, or `>>>` prompts |
+| `collapse` | | `false` | code and text output in one box (implied by `prompt`) |
+| `comment` | | none | prefix for each line of text output, e.g. `##` |
+| `label` | | none | `fig-…`, `tbl-…`, or `eq-…`; see below |
+| `fig-cap`, `tbl-cap` | | none | caption, written in Typst markup |
+| `out-width` | | `fig-width` | displayed width, e.g. `80%` or `3in` |
+| `column` | | `body` | `margin` or `page`; see below |
 
-### Setting up imports
+Project-wide defaults for `fig-width`, `fig-height`, `fig-format`, `fig-dpi`,
+and `error` go in `loom.toml`. Document-wide defaults for `echo`, `output`,
+`warning`, `message`, `prompt`, `collapse`, and `comment` are arguments of
+`loom`: `#show: loom.with(echo: false)`.
+
+### Figures, tables, and cross-references
+
+loom produces standard Typst figures, so they are numbered together with the
+document's other figures and styled by its `figure` rules.
+
+- `label: fig-name` or `fig-cap` puts the cell's images in a
+  `figure(kind: image)`; reference it as `@fig-name`.
+- `label: tbl-name` or `tbl-cap` puts Typst output in a `figure(kind: table)`.
+- `label: eq-name` with `output: asis` labels an equation produced by the
+  cell, e.g. a string `"$ y = X beta $"`.
+
+Captions and Typst output are evaluated with `eval`, which does not see your
+document's definitions. Pass the ones they need with
+`#show: loom.with(scope: (name: value))`.
+
+`column: margin` and `column: page` place the figure (or the whole output)
+with a function supplied by the document, so the template decides what a
+margin is:
 
 ```typst
-#import ".loom/loom.typ": *
+#import "@preview/marginalia:0.3.1" as marginalia
+#show: loom.with(columns: (
+  margin: body => marginalia.note(numbering: none, body),
+  page: body => marginalia.wideblock(body),
+))
 ```
 
-This is the only import you need. Legacy low-level imports via `.loom/julia.typ`, `.loom/r.typ`, and `.loom/_loom_data.typ` still work.
+### Style
 
-## Session model
+Code is shown as a `raw` block, so `show raw` rules apply to it. The boxes
+around code, output, and errors are set with
+`#show: loom.with(style: (code: (fill: luma(240)), output: (color: gray)))`;
+see the defaults at the top of `.loom/loom.typ`.
 
-- Each chapter gets its own **Julia Module** and **R environment**.
-- Variables from one chapter do not leak into another.
-- The **preamble** session runs before all others; its code is replayed into fresh sessions after a reset.
-- Julia and R cells can coexist in the same chapter — they run in separate per-language sessions.
-- Use `session: "name"` to override the default session assignment.
-- Shared `session:` names are rebuilt from preamble plus earlier chapters that use the same session, in document order, whenever a chapter is re-run.
+## Books and sessions
 
-## Caching
-
-Loom caches cell results using content-addressable hashing (SHA-256 of the cell code). On subsequent runs, cells whose code hasn't changed are skipped. Use `--force` to re-execute everything.
-
-If a run fails, Loom now aborts immediately and leaves the previous cache/data files in place rather than writing a partially updated result set.
-
-Cache structure:
-
-```
-.loom/
-  _loom_cache/
-    preamble/
-      manifest.json
-      figures/
-    intro/
-      manifest.json
-      figures/
-        sincos.svg
-        histogram.svg
-    _loom_cache.typ    # Consolidated Typst data
-```
-
-## Daemon lifecycle
-
-Daemons are spawned automatically by `loom run` and `loom watch`. Their lifecycle:
-
-- **`loom run`**: spawns the runtimes the document currently needs, executes all cells, then stops them on exit.
-- **`loom watch`**: starts the runtimes the document currently needs and keeps them alive while watching. If you add the other language later, Loom starts that daemon on demand. Set `prestart_all_languages = true` to start both configured runtimes immediately.
-- **Idle timeout**: daemons self-terminate after 30 minutes of inactivity (configurable via `idle_timeout` in `loom.toml` or `--idle-timeout` on the CLI). Set to `0` to disable.
-- **Manual control**: `loom daemon list` shows running daemons; `loom daemon stop --all` stops them.
+Each `#include` in the root file starts a chapter, named after the included
+file. Every chapter gets its own session per language, so variables do not
+leak between chapters. Cells with the same `session:` name share a session
+across chapters, in document order. Setup cells (`#| setup: true`, or any cell
+in a file named `preamble.typ`) run first and are replayed at the start of
+every session of their language.
 
 ## Live preview
 
-Open two terminals:
+Tinymist recompiles on every keystroke, before you save; loom only sees saved
+files. The Typst library therefore marks each cell:
 
-```sh
-# Terminal 1: watch and auto-rerun changed chapters
-loom watch book.typ
+- a cell whose code (or an *exec* option) differs from the stored result is
+  shown as **stale**, with its old output;
+- a new cell is shown as **not executed yet**;
+- a cell whose code raised an error shows the error.
 
-# Terminal 2: VS Code with Tinymist extension
-# Preview refreshes automatically when loom rewrites the cache
+Saving updates the results. `loom render` (or `typst compile --input
+loom=strict`) refuses to compile while any cell is in one of these states.
+
+## Caching and execution
+
+A cell's stored result is reused only if its code, its execution options, and
+every earlier cell of its session (including setup cells) are unchanged. When
+a cell changes, loom runs it and everything after it in the session. If the
+kernel's session is not already in the state the changed cell expects, loom
+restarts the session and runs all of its cells again, so the outputs of a
+session always come from one uninterrupted execution. Appending cells at the
+end of a chapter therefore runs only the new cells, while editing an earlier
+cell reruns the chapter.
+
+Results live in `.loom/cache/entries.json` and figures in `.loom/figures/`.
+`loom clean` removes results and figures the document no longer uses.
+
+## Configuration
+
+`loom.toml`, next to the root file; everything is optional. `loom init`
+writes a commented template.
+
+```toml
+[execute]
+fig-width = 7
+fig-height = 5
+fig-format = "svg"
+fig-dpi = 300
+error = false
+
+[julia]
+command = "julia"
+args = ["--startup-file=no", "--threads=1,1", "--project=@."]
+
+[r]
+command = "Rscript"
+
+[python]
+command = "python3"
 ```
 
-## Table support
+Kernels run with the directory of the root file as working directory.
 
-### Julia
+## Command line
 
-Use any package that implements `show(io, MIME"text/typst", obj)`:
+| Command | Purpose |
+|---|---|
+| `loom init [DIR]` | write the support files and `loom.toml` |
+| `loom run ROOT [--force]` | execute stale cells (all cells with `--force`) |
+| `loom render ROOT [-- TYPST_ARGS]` | run, then `typst compile` in strict mode |
+| `loom watch ROOT` | keep kernels running and re-run on save |
+| `loom list ROOT` | sessions and the state of their cells |
+| `loom clean ROOT` | remove unused results and figures |
+| `loom kernels list\|stop` | show or stop running kernels |
 
-- **SummaryTables.jl** — `Table(...)` objects render directly
-
-### R
-
-- **tinytable** — `tt()` objects saved via `save_tt()` to `.typ` format
-- **gt** (>= 0.12) — `gt()` objects exported via `as_typst()`
-
-Tables are captured automatically when using `#jltable` / `#rtable`.
+Kernels are started by the `loom` command that needs them and exit when it
+does. Their logs are in `.loom/kernels/`.

@@ -1,0 +1,29 @@
+# loom.toml — project configuration for loom.
+#
+# Every setting is optional; the values shown are the defaults.
+
+# Defaults for execution options. A cell overrides them with `#| key: value`.
+[execute]
+# fig-width = 7        # inches
+# fig-height = 5       # inches
+# fig-format = "svg"   # svg, png, or pdf
+# fig-dpi = 300        # raster resolution
+# error = false        # true: an error is shown as output instead of failing the run
+
+# How each kernel is started: `command args... <kernel script> <kernel args>`.
+# The working directory is the directory of the root .typ file.
+[julia]
+# command = "julia"
+# args = ["--startup-file=no", "--threads=1,1", "--project=@."]
+
+[r]
+# command = "Rscript"
+# args = []
+
+[python]
+# command = "python3"
+# args = []
+
+# Used by `loom render`.
+[typst]
+# command = "typst"
