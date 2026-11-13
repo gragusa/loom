@@ -11,7 +11,8 @@
 # error = false        # true: an error is shown as output instead of failing the run
 
 # How each kernel is started: `command args... <kernel script> <kernel args>`.
-# The working directory is the directory of the root .typ file.
+# The working directory is the directory of the root .typ file; a relative
+# command with a directory part is taken relative to it.
 [julia]
 # command = "julia"
 # args = ["--startup-file=no", "--threads=1,1", "--project=@."]
@@ -21,8 +22,9 @@
 # args = []
 
 [python]
-# command = "python3"
+# command = "python3"           # or a virtual environment: ".venv/bin/python"
 # args = []
+# dataframe = "pandas"          # what an imported data frame becomes: pandas or polars
 
 # Used by `loom render`.
 [typst]

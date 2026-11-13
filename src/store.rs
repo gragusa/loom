@@ -11,6 +11,7 @@
 //! stored result).
 
 use crate::config::Project;
+use crate::env::EnvRecord;
 use crate::plan::Plan;
 use crate::syntax::Document;
 use anyhow::{Context, Result, bail};
@@ -49,6 +50,12 @@ pub struct Entry {
     pub fig_height: f64,
     /// Unix time of the last run that referenced this entry.
     pub used: u64,
+    /// Id of the package environment the result was computed in.
+    #[serde(default)]
+    pub env: Option<String>,
+    /// Exported values: name and file path relative to `.loom/`.
+    #[serde(default)]
+    pub exports: BTreeMap<String, String>,
 }
 
 impl Entry {
@@ -62,6 +69,13 @@ impl Entry {
 pub struct Store {
     version: u32,
     entries: BTreeMap<String, Entry>,
+    /// Package environments, by `EnvRecord::id`.
+    #[serde(default)]
+    envs: BTreeMap<String, EnvRecord>,
+    /// For each cell label, the key of the most recent good result of the
+    /// cell carrying it; shown, marked stale, while that cell is edited.
+    #[serde(default)]
+    labels: BTreeMap<String, String>,
 }
 
 impl Default for Store {
@@ -69,6 +83,8 @@ impl Default for Store {
         Self {
             version: STORE_VERSION,
             entries: BTreeMap::new(),
+            envs: BTreeMap::new(),
+            labels: BTreeMap::new(),
         }
     }
 }
@@ -110,6 +126,29 @@ impl Store {
         self.entries.insert(key, entry);
     }
 
+    pub fn env(&self, id: &str) -> Option<&EnvRecord> {
+        self.envs.get(id)
+    }
+
+    pub fn insert_env(&mut self, record: EnvRecord) -> String {
+        let id = record.id();
+        self.envs.entry(id.clone()).or_insert(record);
+        id
+    }
+
+    /// Point each label of the document at its cell's current result, when
+    /// that result is good.
+    pub fn remember_labels(&mut self, doc: &Document, plan: &Plan) {
+        for (i, cell) in doc.cells.iter().enumerate() {
+            let (Some(label), Some(key)) = (cell.options.label(), &plan.cell_keys[i]) else {
+                continue;
+            };
+            if self.entries.get(key).is_some_and(Entry::is_good) {
+                self.labels.insert(label.to_string(), key.clone());
+            }
+        }
+    }
+
     /// Mark the entries of the current document as used now.
     pub fn touch(&mut self, plan: &Plan) {
         let now = now();
@@ -137,26 +176,33 @@ impl Store {
             self.entries.remove(&key);
             removed += 1;
         }
+        let entries = &self.entries;
+        self.labels.retain(|_, key| entries.contains_key(key));
+        let used_envs: HashSet<&String> = entries.values().filter_map(|e| e.env.as_ref()).collect();
+        self.envs.retain(|id, _| used_envs.contains(id));
 
-        let referenced: HashSet<String> = self
+        let mut referenced: HashSet<String> = self
             .entries
             .values()
             .flat_map(|e| e.outputs.iter())
             .flat_map(image_files)
             .collect();
-        let mut removed_figs = 0;
-        let fig_dir = project.figures_dir();
-        if fig_dir.exists() {
-            for f in std::fs::read_dir(&fig_dir)? {
+        referenced.extend(self.entries.values().flat_map(|e| e.exports.values().cloned()));
+        let mut removed_files = 0;
+        for (dir, prefix) in [(project.figures_dir(), "figures"), (project.shared_dir(), "shared")] {
+            if !dir.exists() {
+                continue;
+            }
+            for f in std::fs::read_dir(&dir)? {
                 let f = f?;
-                let rel = format!("figures/{}", f.file_name().to_string_lossy());
+                let rel = format!("{prefix}/{}", f.file_name().to_string_lossy());
                 if !referenced.contains(&rel) {
                     std::fs::remove_file(f.path())?;
-                    removed_figs += 1;
+                    removed_files += 1;
                 }
             }
         }
-        Ok((removed, removed_figs))
+        Ok((removed, removed_files))
     }
 }
 
@@ -215,23 +261,53 @@ pub fn import_figures(project: &Project, outputs: &mut [Value]) -> Result<()> {
     Ok(())
 }
 
+/// Move the files a kernel exported into `.loom/shared/`, named by the hash
+/// of their contents. Returns name and path relative to `.loom/`.
+pub fn import_shared(project: &Project, exports: &[(String, String)]) -> Result<BTreeMap<String, String>> {
+    let dir = project.shared_dir();
+    let mut out = BTreeMap::new();
+    for (name, src) in exports {
+        let bytes = std::fs::read(src).with_context(|| format!("kernel export {src} cannot be read"))?;
+        let file = format!("{}.arrow", hex::encode(&Sha256::digest(&bytes)[..12]));
+        std::fs::create_dir_all(&dir)?;
+        let dest = dir.join(&file);
+        if !dest.exists() {
+            write_atomic(&dest, &bytes)?;
+        }
+        std::fs::remove_file(src).with_context(|| format!("cannot remove {src}"))?;
+        out.insert(name.clone(), format!("shared/{file}"));
+    }
+    Ok(out)
+}
+
 /// Write `.loom/cells.json` for the current document.
 pub fn write_cells_json(project: &Project, doc: &Document, plan: &Plan, store: &Store) -> Result<()> {
+    let view = |e: &Entry, after: &Option<String>, imports: &BTreeMap<String, String>| {
+        json!({
+            "status": if e.is_good() { "ok" } else { "error" },
+            "session": e.session,
+            "after": after,
+            "imports": imports,
+            "exec": e.exec,
+            "fig-width": e.fig_width,
+            "fig-height": e.fig_height,
+            "outputs": e.outputs,
+        })
+    };
     let mut cells: Map<String, Value> = Map::new();
+    let mut labels: Map<String, Value> = Map::new();
     for (i, cell) in doc.cells.iter().enumerate() {
         let Some(key) = &plan.cell_keys[i] else {
             continue; // eval: false cells are rendered without a lookup
         };
+        if let Some(label) = cell.options.label() {
+            if let Some(e) = store.labels.get(label).and_then(|k| store.get(k)) {
+                labels.insert(label.to_string(), view(e, &None, &BTreeMap::new()));
+            }
+        }
         let view = match store.get(key) {
             None => Value::Null,
-            Some(e) => json!({
-                "status": if e.is_good() { "ok" } else { "error" },
-                "session": e.session,
-                "exec": e.exec,
-                "fig-width": e.fig_width,
-                "fig-height": e.fig_height,
-                "outputs": e.outputs,
-            }),
+            Some(e) => view(e, &plan.after[i], &plan.import_tokens[i]),
         };
         match cells
             .entry(cell.lookup_key())
@@ -241,7 +317,7 @@ pub fn write_cells_json(project: &Project, doc: &Document, plan: &Plan, store: &
             _ => unreachable!("cells.json values are arrays"),
         }
     }
-    let data = json!({ "version": DATA_VERSION, "cells": cells });
+    let data = json!({ "version": DATA_VERSION, "cells": cells, "labels": labels });
     write_atomic(&project.cells_file(), &serde_json::to_vec(&data)?)
 }
 

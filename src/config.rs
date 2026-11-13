@@ -46,6 +46,10 @@ impl Project {
     pub fn figures_dir(&self) -> PathBuf {
         self.loom_dir().join("figures")
     }
+    /// Values exported by cells, as Arrow streams named by content.
+    pub fn shared_dir(&self) -> PathBuf {
+        self.loom_dir().join("shared")
+    }
     /// Stored cell results keyed by cache key.
     pub fn store_file(&self) -> PathBuf {
         self.loom_dir().join("cache").join("entries.json")
@@ -123,18 +127,29 @@ impl Default for ExecuteDefaults {
 pub struct LangConfig {
     pub command: Option<String>,
     pub args: Option<Vec<String>>,
+    /// Python only: what an imported data frame becomes, `pandas` or `polars`.
+    pub dataframe: Option<String>,
 }
 
 impl LangConfig {
-    pub fn command_for(&self, lang: Lang) -> String {
-        self.command.clone().unwrap_or_else(|| {
+    /// The command. A relative path with a directory part, such as
+    /// `.venv/bin/python`, is taken relative to the project directory `dir`;
+    /// a bare name is looked up on PATH.
+    pub fn command_for(&self, lang: Lang, dir: &Path) -> String {
+        let cmd = self.command.clone().unwrap_or_else(|| {
             match lang {
                 Lang::Julia => "julia",
                 Lang::R => "Rscript",
                 Lang::Python => "python3",
             }
             .to_string()
-        })
+        });
+        let p = Path::new(&cmd);
+        if p.is_relative() && p.components().count() > 1 {
+            dir.join(p).display().to_string()
+        } else {
+            cmd
+        }
     }
 
     pub fn args_for(&self, lang: Lang) -> Vec<String> {
@@ -190,6 +205,14 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        if self.julia.dataframe.is_some() || self.r.dataframe.is_some() {
+            bail!("`dataframe` is a [python] setting");
+        }
+        if let Some(d) = &self.python.dataframe {
+            if d != "pandas" && d != "polars" {
+                bail!("[python] dataframe must be \"pandas\" or \"polars\", not \"{d}\"");
+            }
+        }
         let e = &self.execute;
         if !(e.fig_width > 0.0 && e.fig_height > 0.0 && e.fig_dpi > 0.0) {
             bail!("[execute] fig-width, fig-height and fig-dpi must be positive");
@@ -215,14 +238,16 @@ mod tests {
         let cfg: Config = toml::from_str("[execute]\nfig-width = 5\n").unwrap();
         assert_eq!(cfg.execute.fig_width, 5.0);
         assert_eq!(cfg.execute.fig_height, 5.0);
-        assert_eq!(cfg.julia.command_for(Lang::Julia), "julia");
+        assert_eq!(cfg.julia.command_for(Lang::Julia, Path::new("/p")), "julia");
         assert!(cfg.julia.args_for(Lang::Julia).contains(&"--project=@.".to_string()));
     }
 
     #[test]
     fn template_parses() {
         let cfg: Config = toml::from_str(include_str!("../templates/loom.toml")).unwrap();
-        assert_eq!(cfg.r.command_for(Lang::R), "Rscript");
+        assert_eq!(cfg.r.command_for(Lang::R, Path::new("/p")), "Rscript");
+        let venv: Config = toml::from_str("[python]\ncommand = \".venv/bin/python\"\n").unwrap();
+        assert_eq!(venv.python.command_for(Lang::Python, Path::new("/p")), "/p/.venv/bin/python");
     }
 
     #[test]

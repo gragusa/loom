@@ -1,5 +1,7 @@
 mod config;
+mod env;
 mod kernel;
+mod live;
 mod options;
 mod plan;
 mod runner;
@@ -12,7 +14,11 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use config::{Config, Project};
 use kernel::{Kernels, ProjectLock};
+use live::Live;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use store::Store;
 
@@ -104,10 +110,11 @@ fn main() -> Result<()> {
         Command::Run { root, force } => {
             let project = Project::from_root(&root)?;
             let _lock = ProjectLock::acquire(&project)?;
+            install_signal_handler(None)?;
             let cfg = Config::load(&project)?;
             let mut store = Store::load(&project)?;
-            let mut kernels = Kernels::new(&project);
-            let result = run_once(&project, &cfg, &mut store, &mut kernels, force);
+            let mut kernels = Kernels::default();
+            let result = run_once(&project, &cfg, &mut store, &mut kernels, force, None);
             kernels.shutdown();
             result.map(|_| ())
         }
@@ -116,9 +123,10 @@ fn main() -> Result<()> {
             let cfg = Config::load(&project)?;
             {
                 let _lock = ProjectLock::acquire(&project)?;
+                install_signal_handler(None)?;
                 let mut store = Store::load(&project)?;
-                let mut kernels = Kernels::new(&project);
-                let result = run_once(&project, &cfg, &mut store, &mut kernels, false);
+                let mut kernels = Kernels::default();
+                let result = run_once(&project, &cfg, &mut store, &mut kernels, false, None);
                 kernels.shutdown();
                 result?;
             }
@@ -141,7 +149,7 @@ fn main() -> Result<()> {
             let _lock = ProjectLock::acquire(&project)?;
             let cfg = Config::load(&project)?;
             let doc = syntax::parse_document(&project)?;
-            let plan = plan::build_plan(&doc, &cfg.execute);
+            let plan = plan::build_plan(&doc, &cfg.execute)?;
             let mut store = Store::load(&project)?;
             let (entries, figs) = store.prune(&project, &plan, 0)?;
             store.save(&project)?;
@@ -225,18 +233,39 @@ fn run_once(
     store: &mut Store,
     kernels: &mut Kernels,
     force: bool,
+    live: Option<&Live>,
 ) -> Result<runner::RunReport> {
     install_support(&project.loom_dir())?;
     let doc = syntax::parse_document(project)?;
-    let plan = plan::build_plan(&doc, &cfg.execute);
-    let result = runner::run(project, cfg, &doc, &plan, store, kernels, force);
+    let plan = plan::build_plan(&doc, &cfg.execute)?;
+    if let Some(live) = live {
+        *live.keys.lock().expect("lock") = plan_keys(&plan);
+        live.abort.store(false, Ordering::SeqCst);
+    }
+    // While watching, the data file is rewritten after every cell so that
+    // the preview follows a long run.
+    let (doc_ref, plan_ref) = (&doc, &plan);
+    let mut on_cell = move |st: &Store| -> Result<()> {
+        if live.is_some() {
+            store::write_cells_json(project, doc_ref, plan_ref, st)?;
+        }
+        Ok(())
+    };
+    let mut hooks = runner::Hooks {
+        on_cell: &mut on_cell,
+        live,
+    };
+    let result = runner::run(project, cfg, &doc, &plan, store, kernels, force, &mut hooks);
     store.touch(&plan);
+    store.remember_labels(&doc, &plan);
     store.prune(project, &plan, store::KEEP_UNREFERENCED)?;
     store.save(project)?;
     store::write_cells_json(project, &doc, &plan, store)?;
     let report = result?;
     let total = report.executed + report.reused;
-    if report.executed == 0 {
+    if report.aborted {
+        println!("Stopped after {} cell{}.", report.executed, if report.executed == 1 { "" } else { "s" });
+    } else if report.executed == 0 {
         println!("All {total} cells up to date.");
     } else {
         println!(
@@ -249,53 +278,90 @@ fn run_once(
     Ok(report)
 }
 
+fn plan_keys(plan: &plan::Plan) -> HashSet<String> {
+    plan.cell_keys.iter().flatten().cloned().collect()
+}
+
+/// Cache keys of the document as it is on disk now; `None` if it cannot be
+/// parsed (for example while an option is being typed).
+fn current_keys(project: &Project) -> Option<HashSet<String>> {
+    let cfg = Config::load(project).ok()?;
+    let doc = syntax::parse_document(project).ok()?;
+    Some(plan_keys(&plan::build_plan(&doc, &cfg.execute).ok()?))
+}
+
+/// Ctrl-C, SIGTERM, and SIGHUP stop loom and its kernels. During `watch`, a
+/// Ctrl-C while a cell computes interrupts that cell instead; a second one
+/// within two seconds quits.
+fn install_signal_handler(live: Option<Arc<Live>>) -> Result<()> {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP])?;
+    std::thread::spawn(move || {
+        for sig in signals.forever() {
+            if sig == SIGINT {
+                if let Some(live) = &live {
+                    if !live.interrupted_within(Duration::from_secs(2)) && live.interrupt_running() {
+                        eprintln!("\nInterrupting the running cell; press Ctrl-C again to quit.");
+                        continue;
+                    }
+                }
+            }
+            kernel::kill_all_and_exit(128 + sig);
+        }
+    });
+    Ok(())
+}
+
 fn watch(root: &Path) -> Result<()> {
     use notify::{RecursiveMode, Watcher};
 
     let project = Project::from_root(root)?;
     let _lock = ProjectLock::acquire(&project)?;
     let mut store = Store::load(&project)?;
-    let mut kernels = Kernels::new(&project);
-    let loom_dir = project.loom_dir();
+    let mut kernels = Kernels::default();
+    let live = Arc::new(Live::default());
+    install_signal_handler(Some(live.clone()))?;
 
-    let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
+    let loom_dir = project.loom_dir();
+    let relevant = move |p: &Path| {
+        !p.starts_with(&loom_dir)
+            && (p.extension().and_then(|e| e.to_str()) == Some("typ")
+                || p.file_name().and_then(|n| n.to_str()) == Some(config::CONFIG_FILE))
+    };
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let watcher_live = live.clone();
+    let watcher_project = project.clone();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(event) = res {
             if matches!(event.kind, notify::EventKind::Access(_)) {
                 return;
             }
-            for p in event.paths {
-                let _ = tx.send(p);
+            if event.paths.iter().any(|p| relevant(p)) {
+                watcher_live.source_changed(current_keys(&watcher_project));
+                let _ = tx.send(());
             }
         }
     })?;
     watcher.watch(&project.dir, RecursiveMode::Recursive)?;
 
-    let relevant = |p: &Path| {
-        !p.starts_with(&loom_dir)
-            && (p.extension().and_then(|e| e.to_str()) == Some("typ")
-                || p.file_name().and_then(|n| n.to_str()) == Some(config::CONFIG_FILE))
-    };
-
     println!(
-        "Watching {} — Ctrl-C to stop.",
+        "Watching {} — Ctrl-C interrupts a running cell, twice quits.",
         project.display_path(&project.root_file)
     );
     loop {
+        live.dirty.store(false, Ordering::SeqCst);
         match Config::load(&project) {
             Ok(cfg) => {
-                if let Err(e) = run_once(&project, &cfg, &mut store, &mut kernels, false) {
+                if let Err(e) = run_once(&project, &cfg, &mut store, &mut kernels, false, Some(&live)) {
                     eprintln!("Error: {e:#}");
                 }
             }
             Err(e) => eprintln!("Error: {e:#}"),
         }
-        // Wait for a relevant change, then let a burst of saves settle.
-        loop {
-            let p = rx.recv().context("file watcher stopped")?;
-            if relevant(&p) {
-                break;
-            }
+        // Wait for a change unless one arrived during the run, then let a
+        // burst of saves settle.
+        if !live.dirty.load(Ordering::SeqCst) {
+            rx.recv().context("file watcher stopped")?;
         }
         while rx.recv_timeout(Duration::from_millis(200)).is_ok() {}
     }
@@ -305,7 +371,7 @@ fn list(root: &Path) -> Result<()> {
     let project = Project::from_root(root)?;
     let cfg = Config::load(&project)?;
     let doc = syntax::parse_document(&project)?;
-    let plan = plan::build_plan(&doc, &cfg.execute);
+    let plan = plan::build_plan(&doc, &cfg.execute)?;
     let store = Store::load(&project)?;
     println!(
         "{:<8} {:<24} {:>6} {:>6} {:>6}",

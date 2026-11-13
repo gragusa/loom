@@ -1,0 +1,7 @@
+# Configuration for building the manual with loom itself.
+[execute]
+fig-width = 5
+fig-height = 3
+
+[python]
+command = ".venv/bin/python"

@@ -33,6 +33,8 @@ state <- new.env(parent = emptyenv())
 state$sessions <- new.env(parent = emptyenv())
 state$images <- 0L
 state$noted_fallback <- character()
+state$priorities <- new.env(parent = emptyenv())
+state$shared <- 0L
 state$has_svglite <- requireNamespace("svglite", quietly = TRUE)
 state$has_ragg <- requireNamespace("ragg", quietly = TRUE) &&
   exists("agg_record", envir = asNamespace("ragg"), inherits = FALSE)
@@ -174,7 +176,18 @@ error_text <- function(cnd, calls = list(), where = NULL) {
           traceback_lines(calls)), collapse = "\n")
 }
 
-interrupted <- function() simpleError("execution interrupted")
+# An interrupted request ends with an error output whose text starts with
+# "interrupted".
+interrupted_text <- function(where = NULL) {
+  paste(c("interrupted", if (!is.null(where)) paste0("  at ", where)),
+        collapse = "\n")
+}
+
+# Marks an interrupt caught around user code, distinct from user errors.
+interrupted <- function() {
+  structure(class = c("loom_interrupted", "condition"),
+            list(message = "interrupted", call = NULL))
+}
 
 # `where` holds the optional `file` and `line` of the request; `cell_line` is
 # a 1-based line within the cell.
@@ -549,13 +562,12 @@ exec_block <- function(code, env, opts, where) {
   }, add = TRUE)
 
   tryCatch(
-    evaluate::evaluate(lines, envir = env, stop_on_error = 1L,
-                       new_device = FALSE, output_handler = handler,
-                       keep_warning = TRUE, keep_message = TRUE),
+    allowInterrupts(evaluate::evaluate(
+      lines, envir = env, stop_on_error = 1L, new_device = FALSE,
+      output_handler = handler, keep_warning = TRUE, keep_message = TRUE)),
     interrupt = function(cnd) {
       st$failed <- TRUE
-      add(list(type = "error", text = error_text(interrupted(), list(),
-                                                 where_now())))
+      add(list(type = "error", text = interrupted_text(where_now())))
     })
 
   drain_stderr()
@@ -574,16 +586,20 @@ exec_block <- function(code, env, opts, where) {
 exec_inline <- function(code, env, where) {
   calls <- list()
   result <- tryCatch(
-    withCallingHandlers({
+    allowInterrupts(withCallingHandlers({
       exprs <- parse_lines(split_lines(code), where)
       if (length(exprs) != 1L) {
         stop("inline code must be a single expression; found ",
              length(exprs), call. = FALSE)
       }
       inline_output(eval_user(exprs[[1L]], env), env)
-    }, error = function(e) calls <<- user_calls()),
+    }, error = function(e) calls <<- user_calls())),
     error = identity,
     interrupt = function(cnd) interrupted())
+  if (inherits(result, "loom_interrupted")) {
+    text <- interrupted_text(location(where, 1L))
+    return(list(failed = TRUE, outputs = list(list(type = "error", text = text))))
+  }
   if (inherits(result, "error")) {
     where <- if (!inherits(result, "loom_parse_error")) location(where, 1L)
     text <- error_text(result, calls, where)
@@ -601,18 +617,398 @@ run_setup <- function(env, setup) {
   for (i in seq_along(setup)) {
     calls <- list()
     result <- tryCatch(
-      withCallingHandlers({
+      allowInterrupts(withCallingHandlers({
         exprs <- parse(text = setup[[i]], keep.source = FALSE)
         for (expr in exprs) eval_user(expr, env)
         NULL
-      }, error = function(e) calls <<- user_calls()),
+      }, error = function(e) calls <<- user_calls())),
       error = identity,
       interrupt = function(cnd) interrupted())
+    if (inherits(result, "loom_interrupted")) {
+      return(interrupted_text(sprintf("setup string %d", i)))
+    }
     if (inherits(result, "error")) {
       return(error_text(result, calls, sprintf("setup string %d", i)))
     }
   }
   NULL
+}
+
+# ---------------------------------------------------------------------------
+# Session state and loaded packages
+
+# Names R creates on its own; never reported as changed.
+unreported_names <- c(".Random.seed", "...")
+
+# What a name is bound to, read without side effects: the function of an
+# active binding (not its value), and for a promise its expression (forcing
+# it could run arbitrary code). substitute() returns an ordinary binding's
+# object itself, without copying.
+binding_of <- function(name, env) {
+  if (bindingIsActive(name, env)) {
+    list(TRUE, activeBindingFunction(name, env))
+  } else {
+    list(FALSE, eval(call("substitute", as.name(name), env)))
+  }
+}
+
+binding_snapshot <- function(env) {
+  names <- setdiff(ls(env, all.names = TRUE, sorted = FALSE), unreported_names)
+  snapshot <- vector("list", length(names))
+  names(snapshot) <- names
+  for (name in names) snapshot[[name]] <- binding_of(name, env)
+  snapshot
+}
+
+# Base R cannot test whether two objects are the same object, except for
+# environments and external pointers, which identical() compares by
+# reference. Other objects are compared by value with the strictest
+# identical(), so rebinding a name to an equal copy is not reported. The
+# snapshot holds references, so the pointer check at the start of identical()
+# settles unchanged bindings without comparing contents; it also means that a
+# vector modified in place by the request (x[1] <- 0) is copied first.
+same_binding <- function(a, b) {
+  identical(a[[1L]], b[[1L]]) &&
+    identical(a[[2L]], b[[2L]], num.eq = FALSE, single.NA = FALSE,
+              attrib.as.set = FALSE, ignore.bytecode = FALSE,
+              ignore.environment = FALSE, ignore.srcref = FALSE)
+}
+
+changed_names <- function(before, after) {
+  common <- intersect(names(before), names(after))
+  same <- vapply(common, function(name) {
+    same_binding(before[[name]], after[[name]])
+  }, logical(1))
+  sort(c(setdiff(names(after), names(before)),
+         setdiff(names(before), names(after)), common[!same]),
+       method = "radix")
+}
+
+package_priority <- function(path) {
+  priority <- get0(path, envir = state$priorities, inherits = FALSE)
+  if (is.null(priority)) {
+    priority <- unname(read.dcf(file.path(path, "DESCRIPTION"),
+                                fields = "Priority")[1L, 1L])
+    if (is.na(priority)) priority <- ""
+    assign(path, priority, envir = state$priorities)
+  }
+  priority
+}
+
+# Loaded namespaces other than R's base packages. A package loaded from
+# source by pkgload (devtools::load_all) is reported as the source directory,
+# since editing its R files does not change its DESCRIPTION.
+loaded_packages <- function() {
+  out <- list()
+  for (ns in sort(loadedNamespaces(), method = "radix")) {
+    # getNamespaceInfo() refuses the base namespace.
+    path <- if (identical(ns, "base")) system.file(package = "base")
+            else getNamespaceInfo(ns, "path")
+    if (identical(package_priority(path), "base")) next
+    from_source <- exists(".__DEVTOOLS__", envir = asNamespace(ns),
+                          inherits = FALSE)
+    out[[length(out) + 1L]] <- list(
+      name = ns,
+      version = unname(getNamespaceVersion(ns)),
+      kind = if (from_source) "tree" else "file",
+      path = normalizePath(if (from_source) path
+                           else file.path(path, "DESCRIPTION"),
+                           mustWork = TRUE))
+  }
+  out
+}
+
+# ---------------------------------------------------------------------------
+# Shared data: values passed between sessions and languages as Arrow IPC
+# streams, read and written with nanoarrow (see "Shared data" in
+# kernels/PROTOCOL.md).
+
+atomic_types <- c("integer", "double", "logical", "character")
+
+shareable_values <- paste(
+  "data frames (columns of integers, doubles, logicals, strings, factors,",
+  "Dates and POSIXct date-times), atomic vectors, matrices and arrays",
+  "(integer, double, logical or character, without NA) and single values",
+  "of those types")
+
+share_error <- function(...) stop(simpleError(paste0(...)))
+
+need_nanoarrow <- function() {
+  if (!requireNamespace("nanoarrow", quietly = TRUE)) {
+    share_error("the R package 'nanoarrow' is not installed; install it ",
+                "with install.packages(\"nanoarrow\")")
+  }
+}
+
+next_shared_path <- function() {
+  dir.create(state$scratch, recursive = TRUE, showWarnings = FALSE)
+  state$shared <- state$shared + 1L
+  file.path(state$scratch, sprintf("loom-r-%d-data-%d.arrow", Sys.getpid(),
+                                   state$shared))
+}
+
+# NaN is a number, not a missing value.
+has_missing <- function(x) {
+  if (is.double(x)) any(is.na(x) & !is.nan(x)) else anyNA(x)
+}
+
+describe_value <- function(x) {
+  cls <- oldClass(x)
+  if (!is.null(cls)) {
+    return(sprintf("an object of class '%s'", paste(cls, collapse = "/")))
+  }
+  switch(typeof(x),
+    closure = , builtin = , special = "a function",
+    list = "a list",
+    environment = "an environment",
+    NULL = "NULL",
+    paste0("a value of type '", typeof(x), "'"))
+}
+
+# The kind of a data frame column that can be shared, or NA.
+column_kind <- function(col) {
+  if (is.factor(col)) "factor"
+  else if (inherits(col, "Date")) "Date"
+  else if (inherits(col, "POSIXct")) "POSIXct"
+  else if (!is.object(col) && is.null(dim(col)) && typeof(col) %in% atomic_types) {
+    typeof(col)
+  } else NA_character_
+}
+
+# The table to write for `x`, with its loom.kind and, for an array, its
+# shape.
+shared_table <- function(x) {
+  if (is.data.frame(x)) {
+    table <- as.data.frame(x)
+    for (name in names(table)) {
+      col <- table[[name]]
+      kind <- column_kind(col)
+      if (is.na(kind)) {
+        share_error("column '", name, "' is ", describe_value(col), "; data ",
+                    "frame columns can hold integers, doubles, logicals, ",
+                    "strings, factors, Dates and POSIXct date-times")
+      }
+      # nanoarrow cannot write dictionary arrays, so a factor is written as
+      # its labels.
+      if (kind == "factor") table[[name]] <- as.character(col)
+      if (kind == "character") table[[name]] <- enc2utf8(col)
+    }
+    row.names(table) <- NULL
+    return(list(kind = "dataframe", table = table))
+  }
+  if (is.atomic(x) && typeof(x) %in% atomic_types &&
+      all(oldClass(x) %in% c("matrix", "array"))) {
+    if (has_missing(x)) {
+      share_error("it contains missing values (NA), which only data frame ",
+                  "columns can hold")
+    }
+    values <- as.vector(x)
+    if (is.character(values)) values <- enc2utf8(values)
+    if (is.null(dim(x)) && length(x) == 1L) {
+      return(list(kind = "scalar",
+                  table = data.frame(value = values, stringsAsFactors = FALSE)))
+    }
+    shape <- if (is.null(dim(x))) length(x) else dim(x)
+    return(list(kind = "array",
+                table = data.frame(values = values, stringsAsFactors = FALSE),
+                shape = shape))
+  }
+  share_error("it is ", describe_value(x), "; only these values can be ",
+              "shared: ", shareable_values)
+}
+
+# A float64 array in which only NA_real_ is null: nanoarrow would also turn
+# NaN into null, and NaN is a number. The data buffer is R's own vector; the
+# validity bitmap is the data buffer of a bool array.
+double_array <- function(x) {
+  missing <- is.na(x) & !is.nan(x)
+  validity <- if (any(missing)) {
+    nanoarrow::as_nanoarrow_array(!missing)$buffers[[2L]]
+  }
+  nanoarrow::nanoarrow_array_modify(
+    nanoarrow::nanoarrow_array_init(nanoarrow::na_double()),
+    list(length = length(x), null_count = sum(missing),
+         buffers = list(validity, x)))
+}
+
+write_shared <- function(x, path) {
+  shared <- shared_table(x)
+  metadata <- list(loom.kind = shared$kind)
+  if (!is.null(shared$shape)) {
+    metadata[["loom.shape"]] <-
+      as.character(jsonlite::toJSON(as.integer(shared$shape)))
+  }
+  schema <- nanoarrow::nanoarrow_schema_modify(
+    nanoarrow::infer_nanoarrow_schema(shared$table), list(metadata = metadata))
+  array <- nanoarrow::as_nanoarrow_array(shared$table, schema = schema)
+  doubles <- vapply(shared$table, function(col) is.double(col) && !is.object(col),
+                    logical(1))
+  if (any(doubles)) {
+    columns <- array$children
+    for (i in which(doubles)) columns[[i]] <- double_array(shared$table[[i]])
+    array <- nanoarrow::nanoarrow_array_modify(array, list(children = columns))
+  }
+  nanoarrow::write_nanoarrow(array, path)
+}
+
+# Arrow integer types that nanoarrow converts to double (int64, uint32,
+# uint64). Columns whose values all fit in R's integer range become integer.
+wide_integer_formats <- c("l", "I", "L")
+
+narrow_integers <- function(x) {
+  fits <- is.na(x) | (x == trunc(x) & abs(x) <= .Machine$integer.max)
+  if (all(fits)) as.integer(x) else x
+}
+
+# Arrow types of columns that can be shared (format strings of the Arrow C
+# data interface): integers, floats, booleans, strings, date32/date64 and
+# timestamps; a dictionary must have string values.
+shareable_column <- function(column) {
+  if (!is.null(column$dictionary)) {
+    return(column$dictionary$format %in% c("u", "U"))
+  }
+  column$format %in% c("c", "C", "s", "S", "i", "I", "l", "L", "f", "g", "b",
+                       "u", "U", "tdD", "tdm") ||
+    startsWith(column$format, "ts")
+}
+
+arrow_type <- function(column) sub("^<nanoarrow_schema (.*)>$", "\\1", format(column))
+
+imported_array <- function(data, shape_json) {
+  if (!identical(names(data), "values")) {
+    share_error("an array must be stored as one column named 'values'")
+  }
+  if (is.null(shape_json)) share_error("the file has no 'loom.shape' metadata")
+  shape <- tryCatch(jsonlite::parse_json(shape_json, simplifyVector = TRUE),
+                    error = function(e) NULL)
+  if (!is.numeric(shape) || length(shape) == 0L || anyNA(shape) ||
+      any(shape < 0) || any(shape != trunc(shape))) {
+    share_error("invalid loom.shape '", shape_json, "'")
+  }
+  values <- data$values
+  if (!column_kind(values) %in% atomic_types) {
+    share_error("array elements must be numbers, booleans or strings, not ",
+                describe_value(values))
+  }
+  if (has_missing(values)) share_error("the array contains missing values")
+  if (length(values) != prod(shape)) {
+    share_error("loom.shape ", shape_json, " needs ", prod(shape),
+                " elements; the file holds ", length(values))
+  }
+  if (length(shape) == 1L) values else array(values, dim = as.integer(shape))
+}
+
+imported_scalar <- function(data) {
+  if (!identical(names(data), "value") || nrow(data) != 1L) {
+    share_error("a scalar must be stored as one column named 'value' with ",
+                "one row")
+  }
+  value <- data$value
+  if (!column_kind(value) %in% atomic_types) {
+    share_error("a scalar must be a number, a boolean or a string, not ",
+                describe_value(value))
+  }
+  if (has_missing(value)) share_error("the scalar is missing")
+  value
+}
+
+read_shared <- function(file) {
+  if (!file.exists(file)) share_error("the file does not exist")
+  stream <- nanoarrow::read_nanoarrow(file)
+  on.exit(stream$release())
+  schema <- stream$get_schema()
+  kind <- schema$metadata[["loom.kind"]]
+  if (is.null(kind)) share_error("the file has no 'loom.kind' metadata")
+  if (!kind %in% c("dataframe", "array", "scalar")) {
+    share_error("unknown loom.kind '", kind, "'")
+  }
+  columns <- schema$children
+  for (column in columns) {
+    if (!shareable_column(column) ||
+        (kind != "dataframe" && !is.null(column$dictionary))) {
+      share_error("column '", column$name, "' has Arrow type ",
+                  arrow_type(column), ", which cannot be shared")
+    }
+  }
+  batches <- nanoarrow::collect_array_stream(stream, validate = FALSE)
+  dictionary <- vapply(columns, function(ch) !is.null(ch$dictionary),
+                       logical(1))
+  # nanoarrow cannot convert a dictionary flagged as ordered: the flag is
+  # cleared for the conversion and the factor made ordered afterwards.
+  ordered <- dictionary &
+    vapply(columns, function(ch) bitwAnd(ch$flags, 1L) != 0L, logical(1))
+  if (any(ordered)) {
+    for (i in which(ordered)) {
+      columns[[i]] <- nanoarrow::nanoarrow_schema_modify(
+        columns[[i]], list(flags = bitwAnd(columns[[i]]$flags, bitwNot(1L))),
+        validate = FALSE)
+    }
+    schema <- nanoarrow::nanoarrow_schema_modify(
+      schema, list(children = columns), validate = FALSE)
+    batches <- lapply(batches, nanoarrow::nanoarrow_array_set_schema,
+                      schema = schema, validate = FALSE)
+  }
+  ptype <- nanoarrow::infer_nanoarrow_ptype(schema)
+  for (i in which(dictionary)) ptype[[i]] <- factor()
+  # nanoarrow warns when a value cannot be represented exactly in R.
+  data <- withCallingHandlers(
+    nanoarrow::convert_array_stream(
+      nanoarrow::basic_array_stream(batches, schema = schema, validate = FALSE),
+      to = ptype),
+    warning = function(w) share_error(conditionMessage(w)))
+  formats <- vapply(columns, function(ch) ch$format, "")
+  for (i in which(formats %in% wide_integer_formats & !dictionary)) {
+    data[[i]] <- narrow_integers(data[[i]])
+  }
+  for (i in which(ordered)) {
+    data[[i]] <- factor(data[[i]], levels = levels(data[[i]]), ordered = TRUE)
+  }
+  switch(kind,
+    dataframe = data,
+    array = imported_array(data, schema$metadata[["loom.shape"]]),
+    scalar = imported_scalar(data))
+}
+
+# Returns list(values = <named list>) or list(error = <error output text>).
+import_values <- function(imports) {
+  values <- list()
+  for (imp in imports) {
+    value <- tryCatch({
+      need_nanoarrow()
+      read_shared(imp$file)
+    }, error = identity)
+    if (inherits(value, "error")) {
+      return(list(error = sprintf("Error: cannot import '%s' from %s: %s",
+                                  imp$name, imp$file,
+                                  conditionMessage(value))))
+    }
+    values[imp$name] <- list(value)
+  }
+  list(values = values)
+}
+
+# Returns list(files = <list of {name, file}>) or list(error = <error output
+# text>); on error, no file written by this call is left behind.
+export_values <- function(names, env) {
+  written <- list()
+  for (name in names) {
+    file <- next_shared_path()
+    result <- tryCatch({
+      need_nanoarrow()
+      if (!exists(name, envir = env, inherits = FALSE)) {
+        share_error("there is no variable '", name, "' in the session")
+      }
+      write_shared(get(name, envir = env, inherits = FALSE), file)
+      NULL
+    }, error = identity)
+    if (!is.null(result)) {
+      unlink(c(file, vapply(written, function(w) w$file, "")))
+      return(list(error = sprintf("Error: cannot export '%s': %s", name,
+                                  conditionMessage(result))))
+    }
+    written[[length(written) + 1L]] <- list(name = name, file = file)
+  }
+  list(files = written)
 }
 
 # ---------------------------------------------------------------------------
@@ -685,6 +1081,30 @@ field_options <- function(req) {
        format = fmt, dpi = number("fig-dpi"))
 }
 
+field_imports <- function(req) {
+  imports <- req[["imports"]]
+  if (is.null(imports)) return(list())
+  valid <- is.list(imports) && all(vapply(imports, function(i) {
+    is.list(i) && is_string(i[["name"]]) && nzchar(i[["name"]]) &&
+      is_string(i[["file"]])
+  }, logical(1)))
+  if (!valid) {
+    protocol_error("field 'imports' must be an array of {\"name\", \"file\"} objects")
+  }
+  lapply(imports, function(i) list(name = i[["name"]], file = i[["file"]]))
+}
+
+# NULL when the request has no `exports`, which then also has no `exports`
+# in its response.
+field_exports <- function(req) {
+  exports <- req[["exports"]]
+  if (is.null(exports)) return(NULL)
+  if (!is.list(exports) || !all(vapply(exports, is_string, logical(1)))) {
+    protocol_error("field 'exports' must be an array of strings")
+  }
+  vapply(exports, identity, "")
+}
+
 show_position <- function(p) if (is.null(p)) "null" else p
 
 op_hello <- function() {
@@ -717,6 +1137,8 @@ op_exec <- function(req) {
   code <- field_string(req, "code")
   opts <- field_options(req)
   where <- field_where(req)
+  imports <- field_imports(req)
+  exports <- field_exports(req)
   if (!mode %in% c("block", "inline")) {
     protocol_error(sprintf("field 'mode' must be 'block' or 'inline', not '%s'",
                            mode))
@@ -734,11 +1156,46 @@ op_exec <- function(req) {
   }
   # Stays null if the kernel fails internally, so that loom rebuilds the
   # session instead of trusting a state it cannot know.
+  before <- binding_snapshot(rec$env)
   rec$position <- NULL
-  result <- if (mode == "block") exec_block(code, rec$env, opts, where)
-            else exec_inline(code, rec$env, where)
+  # All imports are read before any is bound, so a failed import binds
+  # nothing; the code then does not run.
+  loaded <- if (length(imports)) import_values(imports)
+            else list(values = list())
+  if (!is.null(loaded$error)) {
+    outputs <- list(list(type = "error", text = loaded$error))
+    if (mode == "block" && nzchar(code)) {
+      outputs <- c(list(list(type = "source", code = code)), outputs)
+    }
+    result <- list(failed = TRUE, outputs = outputs)
+  } else {
+    for (imported in names(loaded$values)) {
+      assign(imported, loaded$values[[imported]], envir = rec$env)
+    }
+    result <- if (mode == "block") exec_block(code, rec$env, opts, where)
+              else exec_inline(code, rec$env, where)
+  }
+  exported <- list()
+  if (length(exports) && !result$failed) {
+    written <- export_values(exports, rec$env)
+    if (is.null(written$error)) {
+      exported <- written$files
+    } else {
+      result$failed <- TRUE
+      result$outputs <- c(result$outputs,
+                          list(list(type = "error", text = written$error)))
+    }
+  }
   rec$position <- id
-  list(ok = TRUE, failed = result$failed, outputs = result$outputs)
+  # Imported names are reported even when the value comparison in
+  # changed_names() finds them equal to what they replaced.
+  changed <- sort(unique(c(changed_names(before, binding_snapshot(rec$env)),
+                           names(loaded$values))), method = "radix")
+  # Lists keep length-1 vectors as JSON arrays under auto_unbox.
+  response <- list(ok = TRUE, failed = result$failed, outputs = result$outputs,
+                   changed = as.list(changed), packages = loaded_packages())
+  if (!is.null(exports)) response$exports <- exported
+  response
 }
 
 run_request <- function(req) {
@@ -802,16 +1259,29 @@ encode_response <- function(response) {
   c(charToRaw(enc2utf8(as.character(json))), as.raw(10L))
 }
 
-send <- function(con, response) {
+# A socket write first waits in select() until the socket is writable, and
+# R delivers a SIGINT there even while interrupts are suspended, abandoning
+# the write. select() reports a TCP socket writable only when at least a few
+# kilobytes of buffer are free, so a chunk of at most `chunk` bytes is either
+# written whole or not at all; an interrupted chunk is written again.
+send <- function(con, response, chunk = 1024L) {
   bytes <- encode_response(response)
-  sent <- tryCatch({
-    writeBin(bytes, con)
-    flush(con)
-    TRUE
-  }, warning = identity, error = identity)
-  if (!isTRUE(sent)) {
-    kernel_log("could not send a response: ", conditionMessage(sent))
-    return(FALSE)
+  n <- length(bytes)
+  offset <- 0L
+  while (offset < n) {
+    piece <- bytes[(offset + 1L):min(offset + chunk, n)]
+    result <- tryCatch({
+      writeBin(piece, con)
+      NULL
+    }, interrupt = identity, warning = identity, error = identity)
+    if (is.null(result)) {
+      offset <- offset + length(piece)
+    } else if (inherits(result, "interrupt")) {
+      kernel_log("interrupt received while writing a response; ignored")
+    } else {
+      kernel_log("could not send a response: ", conditionMessage(result))
+      return(FALSE)
+    }
   }
   TRUE
 }
@@ -830,8 +1300,9 @@ exit_if_orphaned <- function() {
   }
 }
 
-# Waits up to two seconds for `con` to become readable. An interrupt while
-# waiting is logged and ignored.
+# Waits up to two seconds for `con` to become readable. socketSelect() waits
+# in select(), which delivers a SIGINT even while interrupts are suspended;
+# arriving while no request runs, it is ignored.
 wait_readable <- function(con) {
   tryCatch(socketSelect(list(con), write = FALSE, timeout = 2),
            interrupt = function(cnd) {
@@ -840,49 +1311,66 @@ wait_readable <- function(con) {
            })
 }
 
+# Delivers a SIGINT that arrived while interrupts were suspended, and
+# ignores it.
+discard_interrupt <- function() {
+  tryCatch(allowInterrupts(Sys.sleep(0.001)), interrupt = function(cnd) {
+    kernel_log("interrupt received while no request was running; ignored")
+  })
+}
+
 # Sends the token line, then answers requests until loom closes the
 # connection. Reads are non-blocking and waiting happens in socketSelect(),
 # so an idle connection never times out; the connection's timeout only
 # bounds writes.
-serve <- function(con) {
+#
+# Interrupts are suspended in the kernel's own code and allowed only while
+# user code runs (allowInterrupts() in the exec and setup paths), so a SIGINT
+# interrupts a running request and is otherwise ignored, and never cuts a
+# request or a response in half.
+serve <- function(con) suspendInterrupts({
   if (!send(con, list(token = state$token))) {
     stop_kernel(1L, "could not send the token line; exiting")
   }
   buffer <- raw()
+  eof <- FALSE
   repeat {
     exit_if_orphaned()
-    if (!isTRUE(wait_readable(con))) next
-    bytes <- tryCatch(read_available(con), error = identity)
-    if (inherits(bytes, "error")) {
-      stop_kernel(1L, "read failed: ", conditionMessage(bytes), "; exiting")
+    newline <- match(as.raw(10L), buffer)
+    if (is.na(newline)) {
+      if (eof) {
+        if (length(buffer)) {
+          kernel_log("loom closed the connection inside a request; ",
+                     length(buffer), " bytes discarded")
+        }
+        stop_kernel(0L, "loom closed the connection; exiting")
+      }
+      if (isTRUE(wait_readable(con))) {
+        bytes <- tryCatch(read_available(con), error = identity)
+        if (inherits(bytes, "error")) {
+          stop_kernel(1L, "read failed: ", conditionMessage(bytes), "; exiting")
+        }
+        # A short read without data pending means loom closed the
+        # connection.
+        eof <- !isIncomplete(con)
+        buffer <- c(buffer, bytes)
+      }
+      next
     }
-    # A short read without data pending means loom closed the connection.
-    eof <- !isIncomplete(con)
-    buffer <- c(buffer, bytes)
-    repeat {
-      newline <- match(as.raw(10L), buffer)
-      if (is.na(newline)) break
-      line <- buffer[seq_len(newline - 1L)]
-      buffer <- buffer[-seq_len(newline)]
-      action <- handle_line(line)
-      if (!send(con, action$response)) {
-        stop_kernel(1L, "the connection is broken; exiting")
-      }
-      if (!is.null(action$exit)) {
-        close(con)
-        stop_kernel(action$status, action$exit)
-      }
-      exit_if_orphaned()
+    line <- buffer[seq_len(newline - 1L)]
+    buffer <- buffer[-seq_len(newline)]
+    discard_interrupt()
+    action <- handle_line(line)
+    discard_interrupt()
+    if (!send(con, action$response)) {
+      stop_kernel(1L, "the connection is broken; exiting")
     }
-    if (eof) {
-      if (length(buffer)) {
-        kernel_log("loom closed the connection inside a request; ",
-                   length(buffer), " bytes discarded")
-      }
-      stop_kernel(0L, "loom closed the connection; exiting")
+    if (!is.null(action$exit)) {
+      close(con)
+      stop_kernel(action$status, action$exit)
     }
   }
-}
+})
 
 parse_args <- function(args) {
   known <- c("--connect", "--token", "--parent-pid", "--scratch")

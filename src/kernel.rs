@@ -18,6 +18,27 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const PROTOCOL_VERSION: u64 = 1;
+
+/// Process ids of the running kernels, so that a signal handler can stop
+/// them before loom exits.
+static KERNEL_PIDS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// The project lock held by this process, removed by `kill_all_and_exit`.
+static LOCK_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Kill every kernel, release the project lock, and exit. Kernels cannot
+/// notice their parent's exit while a cell computes, so loom stops them.
+pub fn kill_all_and_exit(code: i32) -> ! {
+    if let Ok(pids) = KERNEL_PIDS.lock() {
+        for &pid in pids.iter() {
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        }
+    }
+    if let Ok(Some(path)) = LOCK_PATH.lock().as_deref() {
+        let _ = std::fs::remove_file(path);
+    }
+    std::process::exit(code)
+}
 const START_TIMEOUT: Duration = Duration::from_secs(180);
 
 const JULIA_SCRIPT: &str = include_str!("../kernels/julia.jl");
@@ -32,18 +53,43 @@ fn script(lang: Lang) -> (&'static str, &'static str) {
     }
 }
 
+/// An `exec` request.
+pub struct ExecRequest<'a> {
+    pub session: &'a str,
+    pub after: &'a str,
+    pub id: &'a str,
+    pub inline: bool,
+    pub code: &'a str,
+    pub options: Value,
+    pub file: &'a str,
+    pub line: usize,
+    /// Name and absolute path of each imported value.
+    pub imports: Vec<(String, String)>,
+    pub exports: &'a [String],
+}
+
 /// Result of a `reset` or `exec` request.
 #[derive(Debug)]
 pub struct Reply {
     /// User code raised an error.
     pub failed: bool,
     pub outputs: Vec<Value>,
+    /// Names the request created, rebound, or removed (`exec` only).
+    pub changed: Vec<String>,
+    /// Packages loaded in the kernel process (`exec` only).
+    pub packages: Vec<Value>,
+    /// Exported values: name and file in the scratch directory.
+    pub exports: Vec<(String, String)>,
 }
 
 pub struct Kernel {
     pub lang: Lang,
     pub version: String,
     child: Child,
+    /// Process id the kernel reports for itself. It differs from the child
+    /// process when the command is a launcher (juliaup, for example) that
+    /// starts the language in a process of its own; signals must go here.
+    kernel_pid: u32,
     reader: BufReader<TcpStream>,
     writer: TcpStream,
     token: String,
@@ -83,7 +129,7 @@ impl Kernel {
             .context("cannot listen on 127.0.0.1")?;
         let port = listener.local_addr()?.port();
         let token = random_token();
-        let command = cfg.command_for(lang);
+        let command = cfg.command_for(lang, &project.dir);
         let mut cmd = Command::new(&command);
         cmd.args(cfg.args_for(lang))
             .arg(&script_path)
@@ -111,10 +157,14 @@ impl Kernel {
 
         let registry_path = dir.join(format!("{}.json", lang.tag()));
         let mut kernel = Self::connect(lang, child, listener, token, log_path, registry_path)?;
+        KERNEL_PIDS
+            .lock()
+            .expect("lock")
+            .extend([kernel.child.id(), kernel.kernel_pid]);
         std::fs::write(
             &kernel.registry_path,
             serde_json::to_vec(&json!({
-                "pid": kernel.child.id(),
+                "pid": kernel.kernel_pid,
                 "loom_pid": std::process::id(),
                 "version": kernel.version,
             }))?,
@@ -182,6 +232,7 @@ impl Kernel {
         let mut kernel = Self {
             lang,
             version: String::new(),
+            kernel_pid: 0,
             child,
             reader: BufReader::new(stream),
             writer,
@@ -204,7 +255,16 @@ impl Kernel {
             .and_then(Value::as_str)
             .unwrap_or("?")
             .to_string();
+        kernel.kernel_pid = hello
+            .get("pid")
+            .and_then(Value::as_u64)
+            .context("the kernel's hello lacks `pid`")? as u32;
         Ok(kernel)
+    }
+
+    /// Process to signal to interrupt a running cell.
+    pub fn pid(&self) -> u32 {
+        self.kernel_pid
     }
 
     /// The session's position, if the kernel has the session.
@@ -220,39 +280,46 @@ impl Kernel {
             "position": position,
             "setup": setup,
         }))?;
-        let reply = parse_reply(resp)?;
+        let reply = parse_reply(resp, false)?;
         if !reply.failed {
             self.positions.insert(session.to_string(), position.to_string());
         }
         Ok(reply)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn exec(
-        &mut self,
-        session: &str,
-        after: &str,
-        id: &str,
-        inline: bool,
-        code: &str,
-        options: Value,
-        file: &str,
-        line: usize,
-    ) -> Result<Reply> {
-        let resp = self.request(json!({
+    pub fn exec(&mut self, req: ExecRequest) -> Result<Reply> {
+        let mut msg = json!({
             "op": "exec",
-            "session": session,
-            "after": after,
-            "id": id,
-            "mode": if inline { "inline" } else { "block" },
-            "code": code,
-            "options": options,
-            "file": file,
-            "line": line,
-        }))?;
-        let reply = parse_reply(resp)?;
+            "session": req.session,
+            "after": req.after,
+            "id": req.id,
+            "mode": if req.inline { "inline" } else { "block" },
+            "code": req.code,
+            "options": req.options,
+            "file": req.file,
+            "line": req.line,
+        });
+        if !req.imports.is_empty() {
+            msg["imports"] = req
+                .imports
+                .iter()
+                .map(|(name, file)| json!({ "name": name, "file": file }))
+                .collect();
+        }
+        if !req.exports.is_empty() {
+            msg["exports"] = json!(req.exports);
+        }
+        let session = req.session;
+        let id = req.id;
+        let resp = self.request(msg)?;
+        let reply = parse_reply(resp, true)?;
         self.positions.insert(session.to_string(), id.to_string());
         Ok(reply)
+    }
+
+    /// Mark the session's state as unknown, so it is reset before its next use.
+    pub fn forget(&mut self, session: &str) {
+        self.positions.remove(session);
     }
 
     pub fn shutdown(mut self) {
@@ -316,7 +383,13 @@ impl Kernel {
 
 impl Drop for Kernel {
     fn drop(&mut self) {
+        let pids = [self.child.id(), self.kernel_pid];
+        KERNEL_PIDS.lock().expect("lock").retain(|p| !pids.contains(p));
+        // A launcher that is still running may have a live kernel below it.
         if let Ok(None) = self.child.try_wait() {
+            if self.kernel_pid != 0 && self.kernel_pid != self.child.id() {
+                unsafe { libc::kill(self.kernel_pid as libc::pid_t, libc::SIGKILL) };
+            }
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
@@ -324,16 +397,45 @@ impl Drop for Kernel {
     }
 }
 
-fn parse_reply(resp: Value) -> Result<Reply> {
+fn parse_reply(resp: Value, exec: bool) -> Result<Reply> {
     let failed = resp
         .get("failed")
         .and_then(Value::as_bool)
         .context("kernel reply lacks `failed`")?;
-    let outputs = match resp.get("outputs") {
-        Some(Value::Array(a)) => a.clone(),
-        _ => bail!("kernel reply lacks `outputs`"),
+    let array = |k: &str| match resp.get(k) {
+        Some(Value::Array(a)) => Ok(a.clone()),
+        _ => Err(anyhow::anyhow!("kernel reply lacks `{k}`")),
     };
-    Ok(Reply { failed, outputs })
+    let outputs = array("outputs")?;
+    let (changed, packages) = if exec {
+        let changed = array("changed")?
+            .into_iter()
+            .map(|v| v.as_str().map(str::to_string).context("`changed` must hold strings"))
+            .collect::<Result<_>>()?;
+        (changed, array("packages")?)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let exports = match resp.get("exports") {
+        None => Vec::new(),
+        Some(_) => array("exports")?
+            .iter()
+            .map(|e| {
+                let field = |k: &str| e.get(k).and_then(Value::as_str).map(str::to_string);
+                Ok((
+                    field("name").context("export without `name`")?,
+                    field("file").context("export without `file`")?,
+                ))
+            })
+            .collect::<Result<_>>()?,
+    };
+    Ok(Reply {
+        failed,
+        outputs,
+        changed,
+        packages,
+        exports,
+    })
 }
 
 fn random_token() -> String {
@@ -356,31 +458,34 @@ fn log_tail(path: &Path) -> String {
     )
 }
 
-/// The kernels of one `loom` process, started on first use.
+/// The kernels of one `loom` process. Kernels are started by the runner on
+/// first use and kept here between runs.
+#[derive(Default)]
 pub struct Kernels {
-    project: Project,
     map: HashMap<Lang, Kernel>,
 }
 
 impl Kernels {
-    pub fn new(project: &Project) -> Self {
-        Self {
-            project: project.clone(),
-            map: HashMap::new(),
-        }
+    pub fn is_running(&self, lang: Lang) -> bool {
+        self.map.contains_key(&lang)
     }
 
-    pub fn get(&mut self, lang: Lang, cfg: &LangConfig) -> Result<&mut Kernel> {
-        if !self.map.contains_key(&lang) {
-            eprintln!("Starting {} kernel…", lang.name());
-            let k = Kernel::start(lang, cfg, &self.project)?;
-            log::info!("{} kernel {} ready", lang.name(), k.version);
-            self.map.insert(lang, k);
-        }
-        Ok(self.map.get_mut(&lang).expect("kernel just inserted"))
+    /// Position of a session in a running kernel.
+    pub fn position(&self, lang: Lang, session: &str) -> Option<&str> {
+        self.map.get(&lang).and_then(|k| k.position(session))
     }
 
-    /// Forget a kernel after a transport failure, so the next use restarts it.
+    /// Take a running kernel out, to drive it from another thread.
+    pub fn take(&mut self, lang: Lang) -> Option<Kernel> {
+        self.map.remove(&lang)
+    }
+
+    pub fn put(&mut self, kernel: Kernel) {
+        self.map.insert(kernel.lang, kernel);
+    }
+
+    /// Stop a kernel (after a transport failure, or because its packages
+    /// changed), so that the next use starts a new one.
     pub fn discard(&mut self, lang: Lang) {
         self.map.remove(&lang);
     }
@@ -439,6 +544,7 @@ impl ProjectLock {
             {
                 Ok(mut f) => {
                     write!(f, "{}", std::process::id())?;
+                    *LOCK_PATH.lock().expect("lock") = Some(path.clone());
                     return Ok(Self { path });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -463,6 +569,7 @@ impl ProjectLock {
 
 impl Drop for ProjectLock {
     fn drop(&mut self) {
+        *LOCK_PATH.lock().expect("lock") = None;
         let _ = std::fs::remove_file(&self.path);
     }
 }

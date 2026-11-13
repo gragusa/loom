@@ -11,6 +11,7 @@ module LoomKernel
 
 using Sockets
 using Logging
+using Dates
 
 const JS = Base.JuliaSyntax
 const PROTOCOL_VERSION = 1
@@ -430,7 +431,12 @@ function Logging.handle_message(l::LoomLogger, level, message, _module, group, i
     return nothing
 end
 
+# Requests are handled with SIGINT deferred (see `serve`); user code runs with
+# it enabled, so that loom can interrupt a cell.
+run_user(f) = Base.reenable_sigint(f)
+
 function error_text(e, bt)
+    e isa InterruptException && return "interrupted"
     frames = stacktrace(bt)
     # Frames below the cell's top-level scope belong to the kernel.
     i = findfirst(f -> f.func === Symbol("top-level scope"), frames)
@@ -569,7 +575,7 @@ function exec_block(sess::Session, code::String, opts, file::String, line::Int)
                 stmt_line = line - 1 + line_of(code, first_token_byte(code, JS.first_byte(n), JS.last_byte(n)))
                 ex = Expr(:toplevel, LineNumberNode(stmt_line, Symbol(file)), Expr(n))
                 value = try
-                    Core.eval(sess.mod, ex)
+                    run_user(() -> Core.eval(sess.mod, ex))
                 catch e
                     flush_streams!(cap)
                     push!(cap.outputs, Dict{String,Any}("type" => "error", "text" => error_text(e, catch_backtrace())))
@@ -602,7 +608,7 @@ function exec_inline(sess::Session, code::String, opts, file::String, line::Int)
     with_capture(cap) do
         try
             tree = JS.parseall(JS.SyntaxNode, code; filename = file, first_line = line)
-            value = Core.eval(sess.mod, Expr(tree))
+            value = run_user(() -> Core.eval(sess.mod, Expr(tree)))
             d = Dict{String,Any}("text/plain" => Base.invokelatest(sprint, print, value))
             typst = MIME("text/typst")
             if Base.invokelatest(showable, typst, value)
@@ -618,6 +624,252 @@ function exec_inline(sess::Session, code::String, opts, file::String, line::Int)
     # Inline mode returns only the value or the error; printed text is dropped.
     filter!(o -> o["type"] in ("value", "error"), cap.outputs)
     return failed, cap.outputs
+end
+
+# ── State and packages ───────────────────────────────────────────────────────
+
+# Names bound in a session module, with the objects they refer to. Names the
+# module defines for itself (`eval`, `include`, its own name) and generated
+# names (starting with `#`) are left out.
+function bindings(mod::Module)
+    skip = (:eval, :include, :ans, nameof(mod))
+    d = IdDict{Symbol,Any}()
+    for n in names(mod; all = true, imported = true)
+        (n in skip || startswith(String(n), "#")) && continue
+        isdefined(mod, n) || continue
+        d[n] = getglobal(mod, n)
+    end
+    return d
+end
+
+# Names created or rebound (compared with `===`) since `before`. Julia cannot
+# remove a global binding, so removal never occurs.
+function changed_names(before::IdDict{Symbol,Any}, mod::Module)
+    after = bindings(mod)
+    out = String[]
+    for (n, v) in after
+        (haskey(before, n) && before[n] === v) || push!(out, String(n))
+    end
+    return sort!(out)
+end
+
+# UUID => manifest entry for the packages a manifest lists. `Base.parsed_toml`
+# is the parser (and cache) the package loader itself uses.
+function manifest_uuids(path::String)
+    isfile(path) || return Dict{String,Any}()
+    toml = Base.parsed_toml(path)
+    # Manifest format 2 keeps packages under `deps`; format 1 at top level.
+    deps = get(toml, "deps", toml)
+    uuids = Dict{String,Any}()
+    for (_, entries) in deps
+        entries isa Vector || continue
+        for e in entries
+            e isa AbstractDict && haskey(e, "uuid") && (uuids[e["uuid"]] = e)
+        end
+    end
+    return uuids
+end
+
+function environment_manifests()
+    out = String[]
+    for env in Base.load_path()
+        proj = Base.env_project_file(env)
+        proj isa String || continue
+        m = Base.project_file_manifest_path(proj)
+        m === nothing || push!(out, m)
+    end
+    return out
+end
+
+function loaded_packages()
+    manifests = environment_manifests()
+    listed = Dict(m => manifest_uuids(m) for m in manifests)
+    tracked = Any[]
+    untracked = Any[]
+    for (id, mod) in Base.loaded_modules
+        id.uuid === nothing && continue
+        dir = pkgdir(mod)
+        dir === nothing && continue
+        startswith(dir, Sys.STDLIB) && continue
+        v = Base.invokelatest(pkgversion, mod)
+        entry = Dict{String,Any}("name" => id.name, "version" => v === nothing ? nothing : string(v))
+        found = findfirst(m -> haskey(listed[m], string(id.uuid)), manifests)
+        if found === nothing
+            entry["kind"] = "tree"
+            entry["path"] = dir
+            push!(untracked, entry)
+        else
+            entry["kind"] = "manifest"
+            entry["path"] = abspath(manifests[found])
+            entry["uuid"] = string(id.uuid)
+            entry["dir"] = dir
+            push!(tracked, entry)
+        end
+    end
+    # Package extensions are not in any manifest but live in the directory
+    # of their parent package, which is tracked already.
+    tracked_dirs = Set(e["dir"] for e in tracked)
+    filter!(e -> !(e["path"] in tracked_dirs), untracked)
+    foreach(e -> delete!(e, "dir"), tracked)
+    out = vcat(tracked, untracked)
+    sort!(out; by = e -> e["name"])
+    return out
+end
+
+# ── Shared data ──────────────────────────────────────────────────────────────
+
+# Packages are located by UUID in the document's environment and loaded only
+# when a request imports or exports.
+const SHARED_PACKAGES = Dict(
+    "Arrow" => "69666777-d1a9-59fb-9406-91d4454c9d45",
+    "DataFrames" => "a93c6f00-e57d-5684-b7b6-d8193f3e46c0",
+)
+
+function shared_package(name::String)
+    id = Base.PkgId(Base.UUID(SHARED_PACKAGES[name]), name)
+    try
+        return Base.require(id)
+    catch e
+        error("sharing data needs the package $name in the document's Julia environment " *
+              "(add it with `using Pkg; Pkg.add(\"$name\")`): " * sprint(showerror, e))
+    end
+end
+
+const SHAREABLE = "only data frames, arrays of numbers, logicals, or strings, and single " *
+                  "numbers, logicals, or strings can be shared"
+
+shareable_element(T) = T <: Union{Real,AbstractString}
+
+# Load the packages needed to read or write shared data. This must happen
+# before calling `read_shared`/`write_shared` through `invokelatest`: methods
+# of a package loaded during a call are too new for that call's world.
+function load_shared_packages(; dataframes::Bool)
+    shared_package("Arrow")
+    dataframes && shared_package("DataFrames")
+    return nothing
+end
+
+function shared_kind(path::String)
+    Arrow = loaded_module("Arrow")
+    md = Arrow.getmetadata(Arrow.Table(path))
+    md === nothing && error("$path has no loom metadata")
+    return get(md, "loom.kind", nothing)
+end
+
+# Arrow columns are usually nullable, so they arrive as Union{Missing,T}
+# even when no value is missing; such a column gets element type T.
+narrow(v::AbstractVector) = any(ismissing, v) ? v : convert(Vector{nonmissingtype(eltype(v))}, v)
+
+function read_shared(path::String)
+    Arrow = loaded_module("Arrow")
+    tbl = Base.invokelatest(Arrow.Table, path)
+    md = Base.invokelatest(Arrow.getmetadata, tbl)
+    md === nothing && error("$path has no loom metadata")
+    kind = get(md, "loom.kind", nothing)
+    if kind == "dataframe"
+        DataFrames = loaded_module("DataFrames")
+        Tables = loaded_module("Tables")
+        # Columns are collected one by one: copying a dictionary-encoded
+        # column wholesale loses its missing values (Arrow.jl 2.8).
+        columns = [String(n) => narrow(collect(Tables.getcolumn(tbl, n))) for n in Tables.columnnames(tbl)]
+        return DataFrames.DataFrame(columns)
+    end
+    column = Base.invokelatest(getproperty, tbl, kind == "array" ? :values : :value)
+    v = collect(column)
+    any(ismissing, v) && error("$path holds missing values, which arrays and scalars cannot contain")
+    v = convert(Vector{nonmissingtype(eltype(v))}, v)
+    if kind == "scalar"
+        length(v) == 1 || error("$path: a scalar must have one value")
+        return v[1]
+    elseif kind == "array"
+        shape = Int.(parse_json(md["loom.shape"]))
+        prod(shape) == length(v) || error("$path: shape $shape does not match $(length(v)) values")
+        return length(shape) == 1 ? v : reshape(v, shape...)
+    end
+    error("$path: unknown loom.kind $(repr(kind))")
+end
+
+function is_table(x)
+    Tables = loaded_module("Tables")
+    Tables === nothing && return false
+    return Base.invokelatest(Tables.istable, x)
+end
+
+function check_columns(name, x)
+    Tables = loaded_module("Tables")
+    cols = Base.invokelatest(Tables.columns, x)
+    for col in Base.invokelatest(Tables.columnnames, cols)
+        v = Base.invokelatest(Tables.getcolumn, cols, col)
+        T = nonmissingtype(eltype(v))
+        ok = T <: Union{Real,AbstractString} || T <: Union{Dates.Date,Dates.DateTime} ||
+             (string(nameof(T)) == "CategoricalValue") || string(nameof(T)) == "ZonedDateTime"
+        ok || error("cannot export `$name`: column `$col` holds values of type $T; " *
+                    "columns may hold numbers, logicals, strings, categories, dates, and times")
+    end
+end
+
+function write_shared(name::String, x, path::String)
+    Arrow = loaded_module("Arrow")
+    write(tbl, md) = Base.invokelatest(Arrow.write, path, tbl; file = false, metadata = md)
+    if x isa Union{Real,AbstractString} && !(x isa AbstractIrrational)
+        write((value = [x],), ["loom.kind" => "scalar"])
+    elseif x isa AbstractArray && !is_table(x)
+        T = nonmissingtype(eltype(x))
+        if !shareable_element(T)
+            error("cannot export `$name`: an array of $(eltype(x)); $SHAREABLE")
+        end
+        any(ismissing, x) && error("cannot export `$name`: arrays cannot contain missing values")
+        values = convert(Vector{T}, vec(collect(x)))
+        shape = "[" * join(size(x), ",") * "]"
+        write((values = values,), ["loom.kind" => "array", "loom.shape" => shape])
+    elseif is_table(x)
+        check_columns(name, x)
+        write(x, ["loom.kind" => "dataframe"])
+    else
+        error("cannot export `$name`: a value of type $(typeof(x)); $SHAREABLE")
+    end
+    return path
+end
+
+next_shared_path() = (IMAGE_COUNTER[] += 1; joinpath(SCRATCH[], "julia-$(getpid())-$(IMAGE_COUNTER[]).arrow"))
+
+# Binds imported values in the session; returns an error message or nothing.
+function bind_imports(mod::Module, imports)
+    for imp in imports
+        name = imp["name"]
+        value = try
+            run_user() do
+                load_shared_packages(dataframes = false)
+                kind = Base.invokelatest(shared_kind, imp["file"])
+                load_shared_packages(dataframes = kind == "dataframe")
+                Base.invokelatest(read_shared, imp["file"])
+            end
+        catch e
+            return "import of `$name` failed: " * (e isa ErrorException ? e.msg : sprint(showerror, e))
+        end
+        Base.invokelatest(Core.eval, mod, Expr(:(=), Symbol(name), QuoteNode(value)))
+    end
+    return nothing
+end
+
+# Writes the exported values; returns (exports, error message or nothing).
+function write_exports(mod::Module, names)
+    out = Any[]
+    for name in names
+        sym = Symbol(name)
+        if !Base.invokelatest(isdefined, mod, sym)
+            return out, "cannot export `$name`: the cell does not define it"
+        end
+        value = Base.invokelatest(getglobal, mod, sym)
+        try
+            load_shared_packages(dataframes = false)
+            path = Base.invokelatest(write_shared, name, value, next_shared_path())
+            push!(out, Dict{String,Any}("name" => name, "file" => path))
+        catch e
+            return out, e isa ErrorException ? e.msg : "cannot export `$name`: " * sprint(showerror, e)
+        end
+    end
+    return out, nothing
 end
 
 # ── Requests ─────────────────────────────────────────────────────────────────
@@ -640,7 +892,7 @@ function handle_reset(req)
     for (i, code) in enumerate(setup)
         code isa String || error("setup entries must be strings")
         try
-            Base.invokelatest(include_string, sess.mod, code, "setup[$i]")
+            run_user(() -> Base.invokelatest(include_string, sess.mod, code, "setup[$i]"))
         catch e
             err = e isa LoadError ? e.error : e
             text = "in setup code $i: " * error_text(err, catch_backtrace())
@@ -674,15 +926,40 @@ function handle_exec(req)
     if sess === nothing || sess.position != after
         return protocol_error("position mismatch: session '$name' is at $have, request expects $after")
     end
-    failed, outputs = if mode == "block"
+    # Bindings are partitioned by world age: read them in the latest world,
+    # where the cell's own definitions are visible.
+    before = Base.invokelatest(bindings, sess.mod)
+    imports = get(req, "imports", Any[])
+    export_names = get(req, "exports", nothing)
+    import_error = bind_imports(sess.mod, imports)
+    failed, outputs = if import_error !== nothing
+        true, Any[Dict{String,Any}("type" => "source", "code" => code),
+                  Dict{String,Any}("type" => "error", "text" => import_error)]
+    elseif mode == "block"
         exec_block(sess, code, opts, file, line)
     elseif mode == "inline"
         exec_inline(sess, code, opts, file, line)
     else
         error("unknown mode '$mode'")
     end
+    exports = Any[]
+    if export_names !== nothing && !failed
+        exports, export_error = write_exports(sess.mod, export_names)
+        if export_error !== nothing
+            push!(outputs, Dict{String,Any}("type" => "error", "text" => export_error))
+            failed = true
+        end
+    end
     sess.position = id
-    return Dict{String,Any}("ok" => true, "failed" => failed, "outputs" => outputs)
+    resp = Dict{String,Any}(
+        "ok" => true,
+        "failed" => failed,
+        "outputs" => outputs,
+        "changed" => Base.invokelatest(changed_names, before, sess.mod),
+        "packages" => loaded_packages(),
+    )
+    export_names === nothing || (resp["exports"] = exports)
+    return resp
 end
 
 function handle(req, token)
@@ -708,22 +985,33 @@ function parent_alive(pid::Integer)
     return Libc.errno() == Libc.EPERM
 end
 
-# Runs on the interactive thread pool when one exists, so that the kernel
-# also exits while a cell is computing.
+# The watchdog runs on the default thread pool. With `--threads=1,1` the main
+# task, which runs cells, is on the interactive thread, so the watchdog has
+# an OS thread of its own and also exits the kernel while a cell computes.
+# It must not run on the main task's thread: SIGINT would then be delivered
+# to the watchdog instead of the cell.
 function start_watchdog(pid::Integer)
-    check() = while true
-        sleep(2)
-        parent_alive(pid) || ccall(:_exit, Cvoid, (Cint,), 0)
+    function check()
+        while true
+            try
+                sleep(2)
+            catch e
+                e isa InterruptException || rethrow()
+            end
+            parent_alive(pid) || ccall(:_exit, Cvoid, (Cint,), 0)
+        end
     end
-    if isdefined(Threads, :nthreads) && Threads.nthreads(:interactive) > 0
-        Threads.@spawn :interactive check()
-    else
-        @async check()
-    end
+    Threads.@spawn check()
 end
 
 # Serves requests on the single connection to loom; returns when loom closes
 # it (or on an invalid token), after which the kernel exits.
+# Serves requests on the single connection to loom; returns when loom closes
+# it (or on an invalid token), after which the kernel exits.
+#
+# SIGINT is loom's way to interrupt a running cell. It is deferred everywhere
+# except in user code (`run_user`); one that arrives while the kernel waits
+# for a request, or is still pending when a request ends, is discarded.
 function serve(port::Int, token::String)
     conn = connect(Sockets.IPv4(127, 0, 0, 1), port)
     write(conn, write_json(Dict("token" => token)), '\n')
@@ -731,26 +1019,42 @@ function serve(port::Int, token::String)
     @info "loom julia kernel connected" port pid = getpid() julia = VERSION
     try
         while true
-            line = readline(conn)
+            line = try
+                readline(conn)
+            catch e
+                e isa InterruptException && continue
+                rethrow()
+            end
             if isempty(line)
                 eof(conn) && return
                 continue
             end
-            local req = nothing
-            resp = try
-                req = parse_json(line)
-                req isa AbstractDict || error("request is not a JSON object")
-                if get(req, "token", nothing) != token
-                    write(conn, write_json(protocol_error("invalid token")), '\n')
-                    return
+            req = nothing
+            resp = nothing
+            close_after = false
+            try
+                Base.disable_sigint() do
+                    resp = try
+                        req = parse_json(line)
+                        req isa AbstractDict || error("request is not a JSON object")
+                        if get(req, "token", nothing) != token
+                            close_after = true
+                            protocol_error("invalid token")
+                        else
+                            Base.invokelatest(handle, req, token)
+                        end
+                    catch e
+                        @error "internal kernel error" exception = (e, catch_backtrace())
+                        protocol_error("internal kernel error: " * sprint(showerror, e, catch_backtrace()))
+                    end
+                    write(conn, write_json(resp), '\n')
+                    flush(conn)
                 end
-                Base.invokelatest(handle, req, token)
             catch e
-                @error "internal kernel error" exception = (e, catch_backtrace())
-                protocol_error("internal kernel error: " * sprint(showerror, e, catch_backtrace()))
+                # A SIGINT deferred until the end of the request.
+                e isa InterruptException || rethrow()
             end
-            write(conn, write_json(resp), '\n')
-            flush(conn)
+            close_after && return
             req isa AbstractDict && get(req, "op", nothing) == "shutdown" && return
         end
     catch e
@@ -766,6 +1070,8 @@ function main(args)
     mkpath(SCRATCH[])
     # Plots.jl's GR backend opens a window unless told to draw nowhere.
     ENV["GKSwstype"] = "nul"
+    # SIGINT interrupts a cell instead of ending the process.
+    Base.exit_on_sigint(false)
     start_watchdog(parse(Int, opts["parent-pid"]))
     serve(parse(Int, opts["connect"]), opts["token"])
     exit(0)

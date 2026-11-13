@@ -36,6 +36,13 @@ The kernel also checks every two seconds whether the parent process is still
 alive, including while user code is running when the language allows it, and
 exits when it is not.
 
+`loom` interrupts a running request by sending the kernel process SIGINT.
+The request then finishes like a failed one: `failed: true`, with a last
+`error` output whose text starts with `interrupted`, and the session's
+position becomes `id`. A SIGINT that arrives while no request is running,
+or while the kernel is reading a request or writing a response, is ignored:
+the kernel keeps serving the connection.
+
 ## Framing
 
 Each request and each response is one JSON object encoded as UTF-8 on a
@@ -67,6 +74,11 @@ expects before it sends the next cell.
 ```json
 {"ok": true, "protocol": 1, "language": "julia", "version": "1.13.3", "pid": 4242}
 ```
+
+`pid` is the id of the process that executes code. It can differ from the
+process `loom` started, when the command is a launcher (such as juliaup's
+`julia`) that runs the language in a child process; `loom` sends SIGINT to
+`pid`.
 
 ### `reset`
 
@@ -105,18 +117,24 @@ becomes `null`, and the response carries one `error` output:
 - Otherwise it executes `code` in the session and answers
 
   ```json
-  {"ok": true, "failed": false, "outputs": [ ... ]}
+  {"ok": true, "failed": false, "outputs": [ ... ],
+   "changed": ["x", "f"], "packages": [ ... ]}
   ```
 
   and the session's position becomes `id`, whether or not the user code
-  raised. `failed` is `true` when the code raised an error; execution of the
+  raised. `changed` and `packages` are described under "State and
+  packages" below. `failed` is `true` when the code raised an error; execution of the
   cell stops at that error, and the last output is an `error` output.
 
-`options` always contains all four keys. `fig-width` and `fig-height` are in
+`options` always contains these four keys; for Python it may also contain
+`dataframe` (`"pandas"` or `"polars"`, see "Shared data"). `fig-width` and `fig-height` are in
 inches. `fig-format` is one of `svg`, `png`, `pdf`. `fig-dpi` applies to
 raster output.
 
 `mode` is `block` or `inline`; see below.
+
+Optional fields `imports` and `exports` move data between sessions and
+languages; see "Shared data" below.
 
 Optional fields `file` (string) and `line` (integer) give the source file of
 the cell and the line of the first line of `code` in it. A kernel should use
@@ -130,6 +148,127 @@ example `chapter/intro.typ:42`; a kernel that cannot do so ignores them.
 ```
 
 Answers `{"ok": true}` and exits.
+
+## State and packages
+
+Every `exec` response, in both modes and whether or not the code failed,
+carries two more fields.
+
+`changed` lists, sorted, the names in the session namespace that the request
+created or rebound: names present after the request that were absent before,
+or whose binding now refers to a different object. Rebinding is detected by
+object identity where the language provides one (Julia `===`, Python `is`,
+R environments and external pointers): `x = x` changes nothing, while
+`x = copy(x)` changes `x`. R compares other objects by value, so in R
+rebinding a name to an equal copy is not reported; mutating an object in place (`push!(v, 1)`, `v[1] <- 0` on an
+environment, `l.append(1)`) is not reported. Names the kernel or the language
+creates on its own (for example Julia's `ans`, R's `.Random.seed`, Python's
+`__builtins__` and names starting with `__`) are excluded. Names removed by
+the request are included.
+
+`packages` lists every package loaded in the process when the request ends,
+except those that ship with the language itself (Julia standard libraries, R
+base and recommended packages with `Priority: base`, Python standard library
+modules). Each entry is
+
+```json
+{"name": "Plots", "version": "1.41.6", "kind": "manifest", "path": "/abs/Manifest.toml", "uuid": "91a5bcdd-..."}
+```
+
+with `kind` one of:
+
+- `manifest` (Julia): `path` is the manifest file of the environment that
+  provides the package and `uuid` its UUID;
+- `file`: `path` is a file whose contents change whenever the installed
+  package changes: R `<library>/<package>/DESCRIPTION`; Python the `RECORD`
+  file of the distribution's `.dist-info` directory;
+- `tree`: `path` is a directory whose source files define the package, for
+  packages that are not installed from a registry or index (Julia packages
+  outside any manifest, Python editable installs and modules imported from
+  the project directory).
+
+`version` is a string, or `null` when the language does not provide one.
+Paths are absolute. `loom` computes fingerprints from these paths itself;
+kernels report locations only.
+
+## Shared data
+
+```json
+"imports": [{"name": "wages", "file": "/abs/.loom/shared/3f…a1.arrow"}],
+"exports": ["fit_table", "n"]
+```
+
+Before running `code`, the kernel reads each import's file and binds the
+value to `name` in the session. After `code` has run without error, it
+writes the value bound to each name in `exports` to a new file in the
+scratch directory and lists the files in the response:
+
+```json
+"exports": [{"name": "fit_table", "file": "/abs/scratch/…arrow"}, {"name": "n", "file": "…"}]
+```
+
+The `exports` field of the response is present (possibly empty) whenever
+the request had one. A failure to read an import, or to write an export,
+fails the cell like an error raised by user code: `failed: true`, with an
+`error` output whose text says which name failed and why (an unsupported
+value, an undefined name, a missing package). When the code itself failed,
+nothing is exported. Imported names are bindings created by the request and
+appear in `changed`.
+
+### What can be shared
+
+Three kinds of values, and nothing else:
+
+- **data frame**: R `data.frame` (including tibble and data.table); Python
+  pandas or polars `DataFrame`; Julia any Tables.jl table (DataFrames.jl
+  `DataFrame` in practice). Columns may hold integers, floats, logicals,
+  strings, factors/categoricals, dates, and date-times, with missing values.
+  A column of another type is an error naming the column. R row names and
+  pandas indexes are dropped.
+- **array**: R atomic vector, `matrix`, or `array` (numeric, integer,
+  logical, or character, with no class other than `matrix`/`array`); Python
+  `numpy.ndarray` with a numeric, boolean, or string dtype; Julia
+  `AbstractArray` whose elements are `Real`, `Bool`, or `AbstractString`.
+  Missing values (R `NA`, Julia `missing`, Python `None`) are an error; NaN
+  is a number.
+- **scalar**: R length-1 atomic vector without `dim` (numeric, integer,
+  logical, or character); Python `int`, `float`, `bool`, `str`, or a numpy
+  scalar of those kinds; Julia `Real`, `Bool`, or `AbstractString`.
+
+Anything else (a list, an object with a class, a function) is an error
+that names the type and lists what can be shared.
+
+### File format
+
+Every value is written as an Arrow IPC **stream** (not the file format),
+with these keys in the schema's metadata:
+
+| key | value |
+|---|---|
+| `loom.kind` | `dataframe`, `array`, or `scalar` |
+| `loom.shape` | arrays only: the dimensions as a JSON list, e.g. `[3,4]`; a vector is `[n]` |
+
+- A data frame is the table itself, one Arrow column per column.
+- An array is a table with one column `values` holding the elements in
+  column-major order (R and Julia order; numpy uses `order="F"`), of type
+  int32, int64, float64, bool, or utf8.
+- A scalar is a table with one column `value` and one row.
+
+Reading gives: a data frame as R `data.frame`, pandas `DataFrame` (polars
+when the request's options say `"dataframe": "polars"`), Julia
+`DataFrames.DataFrame`; an array as an R vector (one dimension) or
+`matrix`/`array`, a numpy array of the given shape, a Julia `Array`; a
+scalar as a length-1 R vector, a Python `int`/`float`/`bool`/`str`, a Julia
+scalar. Integer widths are kept (an R integer is int32 and arrives in Julia
+as `Int32`).
+
+The R kernel writes factor columns as strings: nanoarrow (0.9) cannot write
+dictionary-encoded columns. It reads dictionaries as factors.
+
+The packages used are R `nanoarrow`, Python `pyarrow` (and pandas or
+polars for data frames), Julia `Arrow.jl` and `DataFrames.jl`, loaded only
+when a request imports or exports. A missing package fails the cell with an
+error that names it.
 
 ## Block mode
 

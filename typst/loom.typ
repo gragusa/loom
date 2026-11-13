@@ -14,12 +14,18 @@
 // Compiling with `--input loom=strict` turns any cell without a current
 // result into an error.
 
+// loom finds cells with the parser of Typst 0.15, and this library must see
+// the same text for each code block.
+#if sys.version < version(0, 15, 0) {
+  panic("loom needs Typst 0.15 or later; this is Typst " + str(sys.version))
+}
+
 #let _data = json("cells.json")
 #let _strict = sys.inputs.at("loom", default: "draft") == "strict"
 #let _langs = ("julia", "r", "python")
 
 // Options that change execution; they must match the stored result.
-#let _exec-keys = ("session", "setup", "error", "fig-width", "fig-height", "fig-format", "fig-dpi")
+#let _exec-keys = ("session", "setup", "stateless", "import", "export", "error", "fig-width", "fig-height", "fig-format", "fig-dpi")
 
 // Text settings in effect where `#show: loom` was applied. Content produced
 // by a show rule on `raw` inherits raw's own text settings (monospace font,
@@ -73,24 +79,70 @@
   (options: lines.slice(0, n), code: if rest.len() == 0 { "" } else { rest.join("\n") })
 }
 
-#let _parse-options(lines) = {
-  let o = (:)
-  for l in lines {
-    let body = l.trim(at: start).slice(2).trim()
-    if body == "" { continue }
-    let i = body.position(":")
-    if i == none { continue }
-    o.insert(body.slice(0, i).trim(), body.slice(i + 1).trim())
-  }
-  o
-}
-
 #let _unquote(v) = {
   for q in ("\"", "'") {
     if v.len() >= 2 and v.starts-with(q) and v.ends-with(q) { return v.slice(1, -1) }
   }
   v
 }
+
+// Option values are strings, except a list written over several lines
+// (`#| fig-subcap:` followed by `#|   - item` lines), which is an array.
+#let _parse-options(lines) = {
+  let o = (:)
+  let list-key = none
+  for l in lines {
+    let body = l.trim(at: start).slice(2).trim()
+    if body == "" { continue }
+    if body.starts-with("-") and list-key != none {
+      o.at(list-key).push(_unquote(body.slice(1).trim()))
+      continue
+    }
+    let i = body.position(":")
+    if i == none { continue }
+    let key = body.slice(0, i).trim()
+    let value = body.slice(i + 1).trim()
+    if value == "" and key == "fig-subcap" {
+      o.insert(key, ())
+      list-key = key
+    } else {
+      o.insert(key, value)
+      list-key = none
+    }
+  }
+  o
+}
+
+// A list written on one line, as `["First", 'Second', third]`; the same rule
+// as `parse_flow_list` in loom's src/options.rs.
+#let _parse-flow(v) = {
+  let v = v.trim()
+  if not (v.starts-with("[") and v.ends-with("]")) { return none }
+  let cs = v.slice(1, -1).clusters()
+  let n = cs.len()
+  let items = ()
+  let i = 0
+  while i < n {
+    while i < n and cs.at(i).trim() == "" { i += 1 }
+    if i >= n { break }
+    let c = cs.at(i)
+    if c == "\"" or c == "'" {
+      let j = i + 1
+      while j < n and cs.at(j) != c { j += 1 }
+      items.push(cs.slice(i + 1, j).join(default: ""))
+      i = j + 1
+      while i < n and cs.at(i).trim() == "" { i += 1 }
+      i += 1
+    } else {
+      let j = i
+      while j < n and cs.at(j) != "," { j += 1 }
+      items.push(cs.slice(i, j).join(default: "").trim())
+      i = j + 1
+    }
+  }
+  items
+}
+
 
 #let _bool(o, key, default) = {
   let v = o.at(key, default: none)
@@ -164,6 +216,9 @@
 }
 
 #let _image-mimes = ("image/svg+xml", "image/png", "application/pdf")
+
+// Kind of the figures made from the images of a cell with `fig-subcap`.
+#let _subfigure-kind = "loom-subfigure"
 
 // Classify one rich output (value or display) into a piece to render.
 #let _rich-piece(data, asis) = {
@@ -270,6 +325,11 @@
   tbl-cap: { let c = o.at("tbl-cap", default: none); if c == none { none } else { _unquote(c) } },
   out-width: { let w = o.at("out-width", default: none); if w == none { none } else { eval(_unquote(w)) } },
   column: _unquote(o.at("column", default: "body")),
+  layout-ncol: int(o.at("layout-ncol", default: "1")),
+  fig-subcap: {
+    let v = o.at("fig-subcap", default: none)
+    if type(v) == array { v } else if type(v) == str { _parse-flow(v) } else { none }
+  },
   )
 }
 
@@ -278,16 +338,15 @@
   lang + " cell `" + if first == none { "" } else { first.trim() } + "`"
 }
 
-#let _render-cell-content(code, lang, o, entry, cfg) = {
+#let _render-cell-content(code, lang, o, entry, status, cfg) = {
   let s = _resolve(o, cfg)
   let style = cfg.style
-  let status = if entry == none {
-    "pending"
-  } else if entry.status == "error" {
-    "error"
-  } else if not _same-dict(entry.exec, _exec-options(o)) {
-    "stale"
-  } else { "ok" }
+  // An edited cell has no result yet; a labeled one shows the last result
+  // its label had, so that a figure does not vanish while it is edited.
+  if entry == none and s.label != none and s.label in _data.at("labels", default: (:)) {
+    entry = _data.labels.at(s.label)
+    status = "stale"
+  }
 
   if _strict and status != "ok" {
     panic("loom: " + _describe(lang, code) + " is " + status + "; run `loom run` (strict mode)")
@@ -307,12 +366,16 @@
   let fig-label = label != none and label.starts-with("fig-")
   let tbl-label = label != none and label.starts-with("tbl-")
   let eq-label = label != none and label.starts-with("eq-")
-  let wants-figure = fig-label or s.fig-cap != none
+  let wants-figure = fig-label or s.fig-cap != none or s.fig-subcap != none
   let tables = pieces.filter(p => p.kind == "typst")
   let wants-table = tbl-label or s.tbl-cap != none
   let markups = pieces.filter(p => p.kind == "markup")
 
+  let subcap-mismatch = s.fig-subcap != none and images.len() > 0 and s.fig-subcap.len() != images.len()
   if _strict {
+    if subcap-mismatch {
+      panic("loom: " + _describe(lang, code) + " has " + str(s.fig-subcap.len()) + " subcaptions for " + str(images.len()) + " images")
+    }
     if fig-label and images.len() == 0 { panic("loom: " + _describe(lang, code) + " has label " + label + " but produced no image") }
     if tbl-label and tables.len() == 0 { panic("loom: " + _describe(lang, code) + " has label " + label + " but produced no Typst table") }
     if eq-label and markups.len() == 0 { panic("loom: " + _describe(lang, code) + " has label " + label + " but has no `output: asis` result") }
@@ -327,9 +390,35 @@
     hook(body)
   }
 
+  let subfigures(imgs) = {
+    let subs = imgs.enumerate().map(((k, p)) => {
+      let cap = s.fig-subcap.at(k, default: none)
+      let f = figure(
+        _image(p.file, entry, s.out-width),
+        caption: if cap != none { _eval-markup(cap, cfg.scope) },
+        kind: _subfigure-kind,
+        supplement: none,
+        numbering: "a",
+        outlined: false,
+      )
+      if fig-label { [#f #std.label(label + "-" + str(k + 1))] } else { f }
+    })
+    // Subfigures are lettered afresh in every figure.
+    counter(figure.where(kind: _subfigure-kind)).update(0)
+    grid(columns: (1fr,) * calc.max(s.layout-ncol, 1), gutter: 0.8em, ..subs)
+  }
+
   let figure-of(imgs) = {
-    let body = if imgs.len() == 1 {
+    let body = if s.fig-subcap != none {
+      subfigures(imgs)
+    } else if imgs.len() == 1 {
       _image(imgs.first().file, entry, s.out-width)
+    } else if s.layout-ncol > 1 {
+      grid(
+        columns: (1fr,) * s.layout-ncol,
+        gutter: 0.8em,
+        ..imgs.map(p => _image(p.file, entry, s.out-width)),
+      )
     } else {
       stack(spacing: 0.5em, ..imgs.map(p => _image(p.file, entry, s.out-width)))
     }
@@ -358,7 +447,7 @@
   }
 
   let out = ()
-  let figure-done = false
+  let last-image = pieces.enumerate().filter(((k, p)) => p.kind == "image").map(((k, p)) => k).at(-1, default: -1)
   let i = 0
   while i < pieces.len() {
     let p = pieces.at(i)
@@ -379,10 +468,10 @@
     } else if p.kind == "error" {
       out.push(_box(style.error, { set text(fill: style.error.color); raw(p.text, block: true) }))
     } else if p.kind == "image" {
-      // All images of a cell form one figure, placed where the first appears.
-      if not figure-done {
+      // All images of a cell form one figure, placed after the code that
+      // drew the last of them.
+      if i == last-image {
         out.push(column-hook(figure-of(images)))
-        figure-done = true
       }
     } else if p.kind == "typst" {
       out.push(column-hook(table-of(p)))
@@ -393,13 +482,88 @@
     i += 1
   }
 
+  if subcap-mismatch {
+    banner = [#banner #text(size: 0.75em, fill: rgb("#9a5b00"))[loom · #s.fig-subcap.len() subcaptions for #images.len() images]]
+  }
   banner
   // Full-width blocks: inside a `stack`, figures would shrink to their
   // content and lose their centering.
   out.map(x => block(width: 100%, spacing: style.spacing, x)).join()
 }
 
-#let _render-cell(code, lang, o, entry, cfg) = _restore(_render-cell-content(code, lang, o, entry, cfg))
+#let _render-cell(code, lang, o, entry, status, cfg) = _restore(_render-cell-content(code, lang, o, entry, status, cfg))
+
+// ── Document-order bookkeeping ───────────────────────────────────────────────
+
+// One state, advanced by a pure function at every evaluated cell, decides
+// whether each cell's stored result is current. Because no update depends on
+// a contextual value, the whole document is resolved in one layout pass.
+//
+// The rules must match `typst_predecessors` in loom's src/plan.rs, which
+// records for every result the token (lookup key and occurrence number) of
+// the cell expected before it in its session (the last earlier cell of the
+// session that is not stateless, or for a session's first cell the last
+// setup cell of its language) and, for each import, the token of the latest
+// earlier cell exporting that name.
+#let _cells = state("loom-cells", (counts: (:), last: (:), dirty: (:), default: (:), exports: (:), current: none))
+
+// A comma-separated list of names, split as loom's src/options.rs splits it.
+#let _names(o, key) = {
+  let v = o.at(key, default: none)
+  if v == none { return () }
+  _unquote(v).split(",").map(n => n.trim()).filter(n => n != "")
+}
+
+#let _advance(d, key, lang, o) = {
+  let n = d.counts.at(key, default: 0) + 1
+  d.counts.insert(key, n)
+  let token = key + "\u{1}" + str(n)
+  let results = _data.cells.at(key, default: ())
+  let entry = if n <= results.len() { results.at(n - 1) } else { none }
+  let stateless = o.at("stateless", default: "false") == "true"
+  let explicit = o.at("session", default: none)
+  let setup = o.at("setup", default: "false") == "true"
+  // A cell without a result (just written or edited) is attributed to the
+  // session of the latest cell of its language that used a default session.
+  let name = if entry != none { entry.session } else if setup { "setup" } else if explicit != none {
+    _unquote(explicit)
+  } else { d.default.at(lang, default: none) }
+  let session = if name == none { none } else { lang + "/" + name }
+  let setup-session = lang + "/setup"
+  let expected = if session != none and session in d.last { d.last.at(session) } else {
+    d.last.at(setup-session, default: none)
+  }
+  let status = if entry == none {
+    "pending"
+  } else if entry.status == "error" {
+    "error"
+  } else if not _same-dict(entry.exec, _exec-options(o)) {
+    "stale"
+  } else if entry.after != expected {
+    "stale"
+  } else if d.dirty.at(session, default: false) or d.dirty.at(setup-session, default: false) {
+    "stale"
+  } else if _names(o, "import").any(name => {
+    // The cell an import reads from must be the one the result was computed
+    // with, and must itself be current.
+    let source = d.exports.at(name, default: none)
+    source == none or not source.ok or entry.at("imports", default: (:)).at(name, default: none) != source.token
+  }) {
+    "stale"
+  } else { "ok" }
+  if entry != none and explicit == none and not setup and entry.session != "setup" {
+    d.default.insert(lang, entry.session)
+  }
+  if session != none and not stateless {
+    d.last.insert(session, token)
+    if status != "ok" { d.dirty.insert(session, true) }
+  }
+  for name in _names(o, "export") {
+    d.exports.insert(name, (token: token, ok: status == "ok"))
+  }
+  d.current = (status: status, entry: entry)
+  d
+}
 
 #let _render-block(it, cfg) = {
   let parts = _split(it.text)
@@ -412,14 +576,11 @@
     return
   }
   let key = "b:" + it.lang + ":" + code
-  // Identical cells are told apart by their order of appearance.
-  let occurrence = counter("loom:" + key)
-  occurrence.step()
+  let lang = it.lang
+  _cells.update(d => _advance(d, key, lang, o))
   context {
-    let n = occurrence.get().first()
-    let results = _data.cells.at(key, default: ())
-    let entry = if n <= results.len() { results.at(n - 1) } else { none }
-    _render-cell(code, it.lang, o, entry, cfg)
+    let c = _cells.get().current
+    _render-cell(code, lang, o, c.entry, c.status, cfg)
   }
 }
 
@@ -430,18 +591,15 @@
   let lang = m.captures.first()
   let code = it.text.slice(m.end).trim()
   let key = "i:" + lang + ":" + code
-  let occurrence = counter("loom:" + key)
-  occurrence.step()
+  _cells.update(d => _advance(d, key, lang, (:)))
   context {
-    let n = occurrence.get().first()
-    let results = _data.cells.at(key, default: ())
-    let entry = if n <= results.len() { results.at(n - 1) } else { none }
-    let status = if entry == none { "pending" } else if entry.status == "error" { "error" } else { "ok" }
+    let c = _cells.get().current
+    let (entry, status) = (c.entry, c.status)
     if _strict and status != "ok" {
       panic("loom: inline " + lang + " code `" + code + "` is " + status + "; run `loom run` (strict mode)")
     }
     show: _restore.with(inline: true)
-    if status == "pending" {
+    if status == "pending" or status == "stale" {
       box(fill: luma(235), inset: (x: 2pt), outset: (y: 2pt), radius: 2pt, text(fill: luma(110), raw(code)))
     } else if status == "error" {
       box(fill: rgb("#fff0f0"), inset: (x: 2pt), outset: (y: 2pt), radius: 2pt, text(fill: rgb("#b00000"), raw(code)))
@@ -507,6 +665,20 @@
     cjk-latin-spacing: text.cjk-latin-spacing,
     justify: par.justify,
   ))
+  // Subfigures: captioned "(a) text", and referenced as the parent figure's
+  // number followed by the letter, in the document's numbering and language.
+  show figure.caption.where(kind: _subfigure-kind): it => context [(#it.counter.display("a")) #it.body]
+  show ref: it => {
+    let el = it.element
+    if el == none or el.func() != figure or el.kind != _subfigure-kind { return it }
+    context {
+      let loc = el.location()
+      let parent = query(figure.where(kind: image).before(loc)).last()
+      let n = numbering(parent.numbering, ..counter(figure.where(kind: image)).at(parent.location()))
+      let letter = numbering("a", ..counter(figure.where(kind: _subfigure-kind)).at(loc))
+      link(loc, [#parent.supplement~#n#letter])
+    }
+  }
   show raw.where(block: true): it => {
     if it.lang not in _langs or it.at("label", default: none) == <loom-echo> { return it }
     _render-block(it, cfg)

@@ -10,12 +10,15 @@
 //! cell of its session together with the cell's code and execution options,
 //! and the first key of a session hashes the last key of the setup session.
 //! A stored result is therefore valid only for the exact sequence of code
-//! that produced it.
+//! that produced it. Cells marked `stateless` do not change the session, so
+//! they are left out of the chain: editing one invalidates only itself.
 
 use crate::config::{ExecuteDefaults, FigFormat};
 use crate::options::SETUP_SESSION;
 use crate::syntax::{Cell, Document, Lang};
+use anyhow::{Result, bail};
 use serde_json::json;
+use std::collections::{BTreeMap, HashMap};
 use sha2::{Digest, Sha256};
 
 /// Changing this string invalidates every stored result; it must change
@@ -77,6 +80,11 @@ pub struct SessionPlan {
     pub cells: Vec<usize>,
     /// Cache key of each cell in `cells`.
     pub keys: Vec<String>,
+    /// Key of the session state in which each cell runs: the key of the
+    /// last earlier cell that is not stateless, or `key0`.
+    pub before: Vec<String>,
+    /// Whether each cell is stateless.
+    pub stateless: Vec<bool>,
 }
 
 impl SessionPlan {
@@ -87,7 +95,13 @@ impl SessionPlan {
     /// Key of the session state in which cell `i` (an index into `cells`)
     /// runs.
     pub fn key_before(&self, i: usize) -> &str {
-        if i == 0 { &self.key0 } else { &self.keys[i - 1] }
+        &self.before[i]
+    }
+
+    /// Key of the session state after cell `i`: a stateless cell leaves it
+    /// unchanged.
+    pub fn key_after(&self, i: usize) -> &str {
+        if self.stateless[i] { &self.before[i] } else { &self.keys[i] }
     }
 }
 
@@ -99,6 +113,14 @@ pub struct Plan {
     pub cell_keys: Vec<Option<String>>,
     /// Effective execution options of each cell; `None` for `eval: false`.
     pub exec: Vec<Option<ExecOptions>>,
+    /// For each cell, its imports and the index of the cell whose export
+    /// each one reads: the latest earlier cell exporting that name.
+    pub imports: Vec<Vec<(String, usize)>>,
+    /// Token of the cell the Typst library will find before each cell in
+    /// its session (see `typst_predecessors`).
+    pub after: Vec<Option<String>>,
+    /// For each cell, the token of the exporting cell of each import.
+    pub import_tokens: Vec<BTreeMap<String, String>>,
 }
 
 impl Plan {
@@ -112,9 +134,10 @@ impl Plan {
     }
 }
 
-pub fn build_plan(doc: &Document, defaults: &ExecuteDefaults) -> Plan {
+pub fn build_plan(doc: &Document, defaults: &ExecuteDefaults) -> Result<Plan> {
     // Group cells into sessions, preserving first-appearance order.
     let mut sessions: Vec<SessionPlan> = Vec::new();
+    let mut session_of = vec![usize::MAX; doc.cells.len()];
     let mut exec = Vec::with_capacity(doc.cells.len());
     for (i, cell) in doc.cells.iter().enumerate() {
         if !cell.options.eval {
@@ -123,58 +146,193 @@ pub fn build_plan(doc: &Document, defaults: &ExecuteDefaults) -> Plan {
         }
         exec.push(Some(ExecOptions::resolve(cell, defaults)));
         let name = cell.session();
-        match sessions
-            .iter_mut()
-            .find(|s| s.lang == cell.lang && s.name == name)
+        let si = match sessions
+            .iter()
+            .position(|s| s.lang == cell.lang && s.name == name)
         {
-            Some(s) => s.cells.push(i),
-            None => sessions.push(SessionPlan {
-                lang: cell.lang,
-                name: name.to_string(),
-                key0: String::new(),
-                cells: vec![i],
-                keys: Vec::new(),
-            }),
-        }
+            Some(si) => si,
+            None => {
+                sessions.push(SessionPlan {
+                    lang: cell.lang,
+                    name: name.to_string(),
+                    key0: String::new(),
+                    cells: Vec::new(),
+                    keys: Vec::new(),
+                    before: Vec::new(),
+                    stateless: Vec::new(),
+                });
+                sessions.len() - 1
+            }
+        };
+        sessions[si].cells.push(i);
+        session_of[i] = si;
     }
-    // Setup sessions run first: every other session's first key depends on
-    // the last key of its language's setup session.
+
+    let imports = resolve_imports(doc)?;
+
+    // Setup sessions are keyed first: every other session's first key
+    // depends on the last key of its language's setup session. Setup cells
+    // cannot import, so they depend on nothing else.
+    let mut cell_keys: Vec<Option<String>> = vec![None; doc.cells.len()];
+    let mut prev: Vec<String> = vec![String::new(); sessions.len()];
+    let mut setup_tail: Vec<(Lang, String)> = Vec::new();
+    for si in 0..sessions.len() {
+        if !sessions[si].is_setup() {
+            continue;
+        }
+        let s = &mut sessions[si];
+        s.key0 = hash_parts(&[CACHE_VERSION, s.lang.tag(), &s.name, ""]);
+        prev[si] = s.key0.clone();
+        for &i in &s.cells.clone() {
+            let key = cell_key(doc, &exec, &cell_keys, &imports, i, &prev[si]);
+            push_key(s, &mut prev[si], key.clone(), doc.cells[i].is_stateless());
+            cell_keys[i] = Some(key);
+        }
+        setup_tail.push((s.lang, prev[si].clone()));
+    }
+    // Other cells in document order, so that the cell an import reads from,
+    // which comes earlier in the document, is keyed before the cell reading.
+    for i in 0..doc.cells.len() {
+        let si = session_of[i];
+        if si == usize::MAX || sessions[si].is_setup() {
+            continue;
+        }
+        let s = &mut sessions[si];
+        if s.keys.is_empty() {
+            let tail = setup_tail
+                .iter()
+                .find(|(l, _)| *l == s.lang)
+                .map(|(_, k)| k.as_str())
+                .unwrap_or("");
+            s.key0 = hash_parts(&[CACHE_VERSION, s.lang.tag(), &s.name, tail]);
+            prev[si] = s.key0.clone();
+        }
+        let key = cell_key(doc, &exec, &cell_keys, &imports, i, &prev[si]);
+        push_key(s, &mut prev[si], key.clone(), doc.cells[i].is_stateless());
+        cell_keys[i] = Some(key);
+    }
+    // Setup sessions run first.
     sessions.sort_by_key(|s| !s.is_setup());
 
-    let mut cell_keys = vec![None; doc.cells.len()];
-    let mut setup_tail: Vec<(Lang, String)> = Vec::new();
-    for s in &mut sessions {
-        let tail = setup_tail
-            .iter()
-            .find(|(l, _)| *l == s.lang)
-            .map(|(_, k)| k.as_str())
-            .unwrap_or("");
-        s.key0 = hash_parts(&[CACHE_VERSION, s.lang.tag(), &s.name, tail]);
-        let mut prev = s.key0.clone();
-        for &i in &s.cells {
-            let cell = &doc.cells[i];
-            let opts = exec[i].as_ref().expect("evaluated cell has options");
-            let raw: String = cell
-                .options
-                .exec_raw()
-                .iter()
-                .map(|(k, v)| format!("{k}={v};"))
-                .collect();
-            let mode = if cell.inline { "inline" } else { "block" };
-            let key = hash_parts(&[&prev, mode, &cell.code, &opts.canonical(), &raw]);
-            s.keys.push(key.clone());
-            cell_keys[i] = Some(key.clone());
-            prev = key;
-        }
-        if s.is_setup() {
-            setup_tail.push((s.lang, prev));
-        }
-    }
-    Plan {
+    let (after, import_tokens) = typst_predecessors(doc);
+    Ok(Plan {
         sessions,
         cell_keys,
         exec,
+        imports,
+        after,
+        import_tokens,
+    })
+}
+
+fn cell_key(
+    doc: &Document,
+    exec: &[Option<ExecOptions>],
+    cell_keys: &[Option<String>],
+    imports: &[Vec<(String, usize)>],
+    i: usize,
+    prev: &str,
+) -> String {
+    let cell = &doc.cells[i];
+    let opts = exec[i].as_ref().expect("evaluated cell has options");
+    let raw: String = cell
+        .options
+        .exec_raw()
+        .iter()
+        .map(|(k, v)| format!("{k}={v};"))
+        .collect();
+    // A cell that imports depends on the exact result it reads from.
+    let sources: String = imports[i]
+        .iter()
+        .map(|(name, e)| {
+            format!("{name}={};", cell_keys[*e].as_deref().expect("exporter keyed first"))
+        })
+        .collect();
+    let mode = if cell.inline { "inline" } else { "block" };
+    hash_parts(&[prev, mode, &cell.code, &opts.canonical(), &raw, &sources])
+}
+
+fn push_key(s: &mut SessionPlan, prev: &mut String, key: String, stateless: bool) {
+    s.before.push(prev.clone());
+    s.stateless.push(stateless);
+    s.keys.push(key.clone());
+    if !stateless {
+        *prev = key;
     }
+}
+
+/// For each cell, the cells its imports read from: for every imported name,
+/// the latest earlier evaluated cell that exports it.
+fn resolve_imports(doc: &Document) -> Result<Vec<Vec<(String, usize)>>> {
+    let mut latest: HashMap<&str, usize> = HashMap::new();
+    let mut out = Vec::with_capacity(doc.cells.len());
+    for (i, cell) in doc.cells.iter().enumerate() {
+        let mut here = Vec::new();
+        if cell.options.eval {
+            for name in &cell.options.imports {
+                let Some(&e) = latest.get(name.as_str()) else {
+                    bail!(
+                        "the {} cell at {}:{} imports `{name}`, but no earlier cell exports it",
+                        cell.lang.name(),
+                        cell.file.display(),
+                        cell.line
+                    );
+                };
+                here.push((name.clone(), e));
+            }
+            for name in &cell.options.exports {
+                latest.insert(name, i);
+            }
+        }
+        out.push(here);
+    }
+    Ok(out)
+}
+
+/// The document-order bookkeeping of the Typst library, run over the
+/// unchanged document. Each evaluated cell has a token (its lookup key and
+/// occurrence number); the library remembers, per session, the token of the
+/// last cell that is not stateless, falling back to the language's setup
+/// session for a session's first cell, and, per exported name, the token of
+/// the latest cell exporting it. A stored result records the tokens expected
+/// before its cell and for its imports, so the library can tell when an
+/// earlier cell of the session, or a cell it imports from, was edited,
+/// inserted, or removed. The library's `_advance` must follow the same rules.
+fn typst_predecessors(doc: &Document) -> (Vec<Option<String>>, Vec<BTreeMap<String, String>>) {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut last: HashMap<String, String> = HashMap::new();
+    let mut exported: HashMap<String, String> = HashMap::new();
+    let mut after = Vec::with_capacity(doc.cells.len());
+    let mut import_tokens = Vec::with_capacity(doc.cells.len());
+    for cell in &doc.cells {
+        if !cell.options.eval {
+            after.push(None);
+            import_tokens.push(BTreeMap::new());
+            continue;
+        }
+        let key = cell.lookup_key();
+        let n = counts.entry(key.clone()).or_insert(0);
+        *n += 1;
+        let token = format!("{key}\u{1}{n}");
+        let session = format!("{}/{}", cell.lang.tag(), cell.session());
+        let setup = format!("{}/{SETUP_SESSION}", cell.lang.tag());
+        let prev = last.get(&session).or_else(|| last.get(&setup)).cloned();
+        let imports: BTreeMap<String, String> = cell
+            .options
+            .imports
+            .iter()
+            .filter_map(|name| exported.get(name).map(|t| (name.clone(), t.clone())))
+            .collect();
+        if !cell.is_stateless() {
+            last.insert(session, token.clone());
+        }
+        for name in &cell.options.exports {
+            exported.insert(name.clone(), token.clone());
+        }
+        after.push(prev);
+        import_tokens.push(imports);
+    }
+    (after, import_tokens)
 }
 
 /// SHA-256 of length-prefixed parts, truncated to 128 bits (32 hex digits).
@@ -202,7 +360,7 @@ mod tests {
         }
         let project = Project::from_root(&dir.path().join(files[0].0)).unwrap();
         let doc = parse_document(&project).unwrap();
-        let plan = build_plan(&doc, &ExecuteDefaults::default());
+        let plan = build_plan(&doc, &ExecuteDefaults::default()).unwrap();
         (doc, plan)
     }
 
@@ -254,6 +412,47 @@ mod tests {
         let exec = keys(&[("doc.typ", "```julia\n#| fig-width: 3\nx = 1\n```\n")]);
         assert_eq!(base[0], render[0]);
         assert_ne!(base[0], exec[0]);
+    }
+
+    #[test]
+    fn imports_depend_on_the_exporting_cell() {
+        let doc = |r: &str| {
+            format!(
+                "```r\n#| export: df\n{r}\n```\n```python\nx = 1\n```\n```python\n#| import: df\ndf.shape\n```\n```julia\ny = 2\n```\n"
+            )
+        };
+        let (_, plan) = plan_for(&[("doc.typ", &doc("df <- mtcars"))]);
+        assert_eq!(plan.imports[2], vec![("df".to_string(), 0)]);
+        let k1 = plan.cell_keys.clone();
+        let (_, plan2) = plan_for(&[("doc.typ", &doc("df <- iris"))]);
+        let k2 = plan2.cell_keys;
+        assert_ne!(k1[0], k2[0]);
+        assert_eq!(k1[1], k2[1], "a Python cell that does not import is unaffected");
+        assert_ne!(k1[2], k2[2], "the importing cell follows its exporter");
+        assert_eq!(k1[3], k2[3]);
+    }
+
+    #[test]
+    fn an_import_without_an_earlier_export_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("doc.typ");
+        std::fs::write(&p, "```python\n#| import: df\nx\n```\n```r\n#| export: df\ndf <- 1\n```\n").unwrap();
+        let project = Project::from_root(&p).unwrap();
+        let doc = parse_document(&project).unwrap();
+        let err = build_plan(&doc, &ExecuteDefaults::default()).unwrap_err().to_string();
+        assert!(err.contains("imports `df`, but no earlier cell exports it"), "{err}");
+    }
+
+    #[test]
+    fn editing_a_stateless_cell_changes_only_its_key() {
+        let doc = |b: &str| {
+            format!("```julia\na = 1\n```\n```julia\n#| stateless: true\n{b}\n```\n```julia\nc = 3\n```\n")
+        };
+        let k1 = keys(&[("doc.typ", &doc("show(a)"))]);
+        let k2 = keys(&[("doc.typ", &doc("show(a + 1)"))]);
+        assert_eq!(k1[0], k2[0]);
+        assert_ne!(k1[1], k2[1]);
+        assert_eq!(k1[2], k2[2]);
     }
 
     #[test]

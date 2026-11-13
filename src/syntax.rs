@@ -77,6 +77,10 @@ impl Cell {
         self.options.setup == Some(true)
     }
 
+    pub fn is_stateless(&self) -> bool {
+        self.options.stateless == Some(true)
+    }
+
     pub fn session(&self) -> &str {
         if self.is_setup() {
             SETUP_SESSION
@@ -115,10 +119,9 @@ pub fn parse_document(project: &Project) -> Result<Document> {
 fn check_unique_labels(project: &Project, doc: &Document) -> Result<()> {
     let mut seen: std::collections::HashMap<&str, &Cell> = Default::default();
     for cell in &doc.cells {
-        let Some(label) = cell.options.raw.get("label") else {
+        let Some(label) = cell.options.label() else {
             continue;
         };
-        let label = label.trim_matches(|c| c == '"' || c == '\'');
         if let Some(first) = seen.insert(label, cell) {
             bail!(
                 "label `{label}` is used by the cells at {} and {}",

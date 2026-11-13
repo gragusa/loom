@@ -1,6 +1,6 @@
 [package]
 name = "loom"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Executes Julia, R, and Python code cells in Typst documents"
 
@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+signal-hook = "0.3"
 env_logger = "0.11"
 hex = "0.4"
 libc = "0.2"

@@ -6,7 +6,9 @@ with the shared token, then answers one JSON request per line with one JSON
 response per line, executing code in named sessions.
 
 Only the standard library is required.  matplotlib is used when user code has
-loaded it; the kernel never imports it on its own.
+loaded it; the kernel never imports it on its own.  pyarrow (with pandas or
+polars for data frames, numpy for arrays) is imported only by requests that
+import or export shared data.
 
 Usage:
     python3 python.py --connect P --token T --parent-pid PID --scratch DIR
@@ -26,6 +28,9 @@ import base64
 import bisect
 import builtins
 import hmac
+import importlib
+import importlib.metadata
+import inspect
 import io
 import itertools
 import json
@@ -33,8 +38,11 @@ import linecache
 import math
 import platform
 import re
+import signal
+import site
 import socket
 import sys
+import sysconfig
 import threading
 import time
 import traceback
@@ -59,13 +67,18 @@ _PY_NEWLINE = re.compile(r"\r\n|\r|\n")
 _SURROGATE = re.compile("[\ud800-\udfff]")
 
 _BACKEND_MODULE = "loom_python_kernel_backend"
+# Python 3.9 has no list of standard-library modules; module locations decide.
+_STDLIB_NAMES = getattr(sys, "stdlib_module_names", frozenset())
 _PENDING_FIGURE = "pending-figure"
 
 _sessions = {}
 _scratch = None
 _current = None  # the _Cell collecting output, or None between cells
+_request_running = False  # a reset or exec request is running code
+_in_user_code = False  # inside a `with _USER_CODE` block
+_interrupt_pending = False  # SIGINT arrived while kernel code of a request ran
 _backend_checked = False
-_image_numbers = itertools.count(1)
+_scratch_numbers = itertools.count(1)
 _source_numbers = itertools.count(1)
 
 
@@ -85,23 +98,79 @@ class _UserError(Exception):
         self.exc = exc
 
 
+class _ShareError(Exception):
+    """An import or export that failed; the message is the whole error text."""
+
+
 class _UserCode:
     """Context manager marking code whose exceptions belong to the user.
 
     Everything raised inside, including SystemExit and KeyboardInterrupt, is
     re-raised as _UserError; exceptions raised elsewhere are kernel errors.
+    An interrupt that arrived while kernel code ran is raised on entry, or on
+    exit when the block completed.
     """
 
     def __enter__(self):
+        global _in_user_code, _interrupt_pending
+        if _interrupt_pending:
+            _interrupt_pending = False
+            raise _UserError(KeyboardInterrupt())
+        _in_user_code = True
         return self
 
     def __exit__(self, kind, exc, tb):
-        if exc is None or isinstance(exc, _UserError):
+        global _in_user_code, _interrupt_pending
+        _in_user_code = False
+        if exc is None:
+            if _interrupt_pending:
+                _interrupt_pending = False
+                raise _UserError(KeyboardInterrupt())
+            return False
+        if isinstance(exc, _UserError):
             return False
         raise _UserError(exc) from None
 
 
 _USER_CODE = _UserCode()
+_USER_CODE_FRAMES = (_UserCode.__enter__.__code__, _UserCode.__exit__.__code__)
+
+
+def _on_sigint(signum, frame):
+    """SIGINT interrupts the running request and is ignored otherwise.
+
+    KeyboardInterrupt is raised only inside user-code blocks, where it becomes
+    a user error; raised in kernel code (socket reads and writes, JSON,
+    bookkeeping) it would abort the kernel.  Elsewhere during a request the
+    interrupt is recorded and raised at the next block boundary.
+    """
+    global _interrupt_pending
+    if not _request_running:
+        return  # idle, reading a request, or writing a response
+    if _in_user_code and (frame is None or frame.f_code not in _USER_CODE_FRAMES):
+        raise KeyboardInterrupt
+    _interrupt_pending = True
+
+
+def _begin_request():
+    global _request_running, _interrupt_pending
+    _interrupt_pending = False
+    _request_running = True
+
+
+def _end_request():
+    """Stop accepting interrupts; report whether one is still unhandled."""
+    global _request_running, _interrupt_pending
+    _request_running = False
+    pending, _interrupt_pending = _interrupt_pending, False
+    return pending
+
+
+_INTERRUPTED = "interrupted (KeyboardInterrupt)"
+
+
+def _is_interrupted_error(output):
+    return output["type"] == "error" and output["text"].startswith("interrupted")
 
 
 # ── Output capture ──────────────────────────────────────────────────────────
@@ -175,9 +244,25 @@ def _reset_warning_registries():
 
 def _format_exception(exc):
     """Traceback text for a user error, without the kernel's own frames."""
+    if isinstance(exc, _ShareError):
+        return str(exc)
     tb = exc.__traceback__
     while tb is not None and tb.tb_frame.f_globals is _KERNEL_GLOBALS:
         tb = tb.tb_next
+    if isinstance(exc, KeyboardInterrupt):
+        # Raised by _on_sigint, whose frame ends the traceback.
+        previous, last = None, tb
+        while last is not None and last.tb_next is not None:
+            previous, last = last, last.tb_next
+        if last is not None and last.tb_frame.f_code is _on_sigint.__code__:
+            if previous is None:
+                tb = None
+            else:
+                previous.tb_next = None
+        if tb is None:
+            return _INTERRUPTED
+        return _INTERRUPTED + "\n" + "".join(
+            traceback.format_exception(type(exc), exc, tb)).rstrip("\n")
     if isinstance(exc, SyntaxError) and exc.text is None and exc.filename and exc.lineno:
         # Code compiled from an AST carries no source text; linecache has it.
         text = linecache.getline(exc.filename, exc.lineno)
@@ -433,12 +518,13 @@ def _unmanaged_figure(value):
 # ── MIME bundles ────────────────────────────────────────────────────────────
 
 
-def _image_path(fmt):
-    return os.path.join(_scratch, f"python-{os.getpid()}-{next(_image_numbers)}.{fmt}")
+def _scratch_path(extension):
+    """A new file name in the scratch directory, unique for the life of the process."""
+    return os.path.join(_scratch, f"python-{os.getpid()}-{next(_scratch_numbers)}.{extension}")
 
 
 def _figure_display(fig, fmt):
-    path = _image_path(fmt)
+    path = _scratch_path(fmt)
     fig.savefig(path, format=fmt)
     return {"type": "display", "data": {_IMAGE_MIME[fmt]: {"file": path}}}
 
@@ -491,7 +577,7 @@ def _rich_data(value, preferred):
         data = _call_repr(value, _IMAGE_REPR[fmt])
         if data is None:
             continue
-        path = _image_path(fmt)
+        path = _scratch_path(fmt)
         with open(path, "wb") as fh:
             fh.write(_image_bytes(value, fmt, data))
         return {_IMAGE_MIME[fmt]: {"file": path}}
@@ -712,6 +798,468 @@ def _run_setup(session, sources):
         _close_all_figures()
 
 
+# ── State and packages ──────────────────────────────────────────────────────
+
+
+def _is_user_name(name):
+    return isinstance(name, str) and not name.startswith("__")
+
+
+def _changed_names(before, after):
+    """Names created, rebound to a different object, or removed, sorted."""
+    changed = {name for name, value in after.items()
+               if _is_user_name(name) and (name not in before or before[name] is not value)}
+    changed.update(name for name in before if _is_user_name(name) and name not in after)
+    return sorted(changed)
+
+
+def _within(path, directories):
+    return any(path == d or path.startswith(d.rstrip(os.sep) + os.sep) for d in directories)
+
+
+def _library_dirs():
+    """Real paths of the standard-library directories and of the site directories."""
+    paths = sysconfig.get_paths()
+    stdlib = {paths["stdlib"], paths["platstdlib"]}
+    sites = {paths["purelib"], paths["platlib"]}
+    if hasattr(site, "getsitepackages"):
+        sites.update(site.getsitepackages())
+    if hasattr(site, "getusersitepackages"):
+        sites.add(site.getusersitepackages())
+    return ({os.path.realpath(d) for d in stdlib if d},
+            {os.path.realpath(d) for d in sites if d})
+
+
+def _module_location(module):
+    """A package's directory or a module's file, or None.
+
+    Reads the module's __dict__ directly: attribute access on a lazily
+    loaded module would execute it.
+    """
+    try:
+        attrs = object.__getattribute__(module, "__dict__")
+    except AttributeError:
+        return None
+    file = attrs.get("__file__")
+    path = attrs.get("__path__")
+    if path is not None:
+        if isinstance(file, str):
+            return os.path.dirname(os.path.abspath(file))
+        entries = list(path)  # namespace package
+        return os.path.abspath(entries[0]) if entries and isinstance(entries[0], str) else None
+    return os.path.abspath(file) if isinstance(file, str) else None
+
+
+def _top_level_names(dist):
+    """Top-level modules a distribution provides, as importlib.metadata infers them."""
+    declared = (dist.read_text("top_level.txt") or "").split()
+    if declared:
+        return declared
+    names = set()
+    for file in dist.files or ():
+        parts = file.parts
+        top = parts[0] if len(parts) > 1 else (inspect.getmodulename(file.name) or file.name)
+        if "." not in top:
+            names.add(top)
+    return sorted(names)
+
+
+def _record_file(dist):
+    """Absolute path of the distribution's RECORD file, or None (egg-info has none)."""
+    meta = getattr(dist, "_path", None)
+    if meta is not None:
+        record = os.path.join(str(meta), "RECORD")
+        return os.path.abspath(record) if os.path.isfile(record) else None
+    for file in dist.files or ():
+        if file.name == "RECORD" and file.parent.name.endswith(".dist-info"):
+            return os.path.abspath(str(file.locate()))
+    return None
+
+
+class _PackageIndex:
+    """Loaded top-level modules outside the standard library, by distribution.
+
+    Mapping modules to distributions means reading every installed
+    distribution's metadata, which takes tenths of a second; the map is
+    rebuilt only when a module appears that was not loaded at the last
+    build, and each distribution's metadata is read once.
+    """
+
+    def __init__(self):
+        self._dirs = None
+        self._metadata = {}  # metadata directory -> (name, top-level names)
+        self._dists = None  # top-level module name -> [(name, Distribution)]
+        self._known = frozenset()  # modules loaded when _dists was built
+        self._entries = {}  # (module name, location) -> [entry]
+
+    def report(self):
+        if self._dirs is None:
+            self._dirs = _library_dirs()
+        modules = {}
+        for name, module in list(sys.modules.items()):
+            if ("." in name or module is None or name.startswith("__")
+                    or name == _BACKEND_MODULE or name in sys.builtin_module_names
+                    or name in _STDLIB_NAMES):
+                continue
+            modules[name] = module
+        if self._dists is None or not self._known.issuperset(modules):
+            self._dists = self._map_distributions()
+            self._known = frozenset(modules)
+            self._entries = {}
+        found = {}
+        for name, module in modules.items():
+            location = _module_location(module)
+            entries = self._entries.get((name, location))
+            if entries is None:
+                entries = self._entries[(name, location)] = self._describe(name, location)
+            for entry in entries:
+                found[(entry["name"], entry["kind"], entry["path"])] = entry
+        return [found[key] for key in sorted(found)]
+
+    def _map_distributions(self):
+        mapping = {}
+        seen = set()
+        for dist in importlib.metadata.distributions():
+            meta = getattr(dist, "_path", None)
+            cached = self._metadata.get(str(meta)) if meta is not None else None
+            if cached is None:
+                cached = (dist.metadata["Name"], _top_level_names(dist))
+                if meta is not None:
+                    self._metadata[str(meta)] = cached
+                if not cached[0]:
+                    _log(f"ignoring a distribution without a name: {meta}")
+            name, tops = cached
+            if not name:
+                continue
+            key = re.sub(r"[-_.]+", "-", name).lower()
+            if key in seen:
+                continue  # shadowed by the same distribution earlier on sys.path
+            seen.add(key)
+            for top in tops:
+                mapping.setdefault(top, []).append((name, dist))
+        return mapping
+
+    def _describe(self, name, location):
+        stdlib_dirs, site_dirs = self._dirs
+        real = os.path.realpath(location) if location is not None else None
+        if real is not None and _within(real, stdlib_dirs) and not _within(real, site_dirs):
+            return []  # standard library
+        dists = self._dists.get(name)
+        if not dists:
+            # Without a location there is nothing to report.  Modules under a
+            # site directory without a distribution of their own belong to an
+            # installed package (Cython's helper modules, for example).
+            if real is None or _within(real, site_dirs):
+                return []
+            return [{"name": name, "version": None, "kind": "tree", "path": location}]
+        entries = []
+        for dist_name, dist in dists:
+            record = _record_file(dist)
+            base = os.path.realpath(str(dist.locate_file("")))
+            if record is not None and (real is None or _within(real, {base})):
+                entries.append({"name": dist_name, "version": dist.version,
+                                "kind": "file", "path": record})
+            elif location is not None:
+                # An editable install: the code lives outside the install location.
+                entries.append({"name": dist_name, "version": dist.version,
+                                "kind": "tree", "path": location})
+        return entries
+
+
+_PACKAGES = _PackageIndex()
+
+
+# ── Shared data ─────────────────────────────────────────────────────────────
+
+_SHAREABLE = ("only data frames (pandas or polars DataFrame), numpy arrays with a "
+              "numeric, boolean, or string dtype, and scalars (int, float, bool, str, "
+              "or a numpy scalar of those kinds) can be shared")
+_COLUMN_TYPES = ("data frame columns may hold integers, floats, booleans, strings, "
+                 "categoricals, dates, and date-times")
+
+
+def _share_module(name, label):
+    """Import a package needed for sharing data; its absence is a cell error."""
+    try:
+        return importlib.import_module(name)
+    except ImportError as exc:
+        raise _ShareError(f"{label}: sharing data needs the Python package '{name}', "
+                          f"which cannot be imported ({exc})") from None
+
+
+def _is_text_type(pa, t):
+    return (pa.types.is_string(t) or pa.types.is_large_string(t)
+            or (hasattr(pa.types, "is_string_view") and pa.types.is_string_view(t)))
+
+
+def _type_name(value):
+    kind = type(value)
+    if kind.__module__ == "builtins":
+        return kind.__qualname__
+    return f"{kind.__module__}.{kind.__qualname__}"
+
+
+def _read_shared(name, path, frames):
+    """The value stored in the Arrow IPC stream at `path`."""
+    label = f"import '{name}'"
+    if not name.isidentifier():
+        raise _ShareError(f"{label}: not a valid Python name")
+    pa = _share_module("pyarrow", label)
+    ipc = _share_module("pyarrow.ipc", label)
+    try:
+        with pa.OSFile(path, "rb") as source:
+            table = ipc.open_stream(source).read_all()
+    except Exception as exc:
+        raise _ShareError(f"{label}: cannot read {path}: {type(exc).__name__}: {exc}") from None
+    meta = table.schema.metadata or {}
+    kind = meta.get(b"loom.kind", b"").decode("utf-8", "replace")
+    try:
+        if kind == "dataframe":
+            return _read_dataframe(label, table, frames, pa)
+        if kind == "array":
+            return _read_array(label, table, meta, pa)
+        if kind == "scalar":
+            return _read_scalar(label, table, pa)
+    except _ShareError:
+        raise
+    except Exception as exc:
+        raise _ShareError(f"{label}: cannot convert {path}: {type(exc).__name__}: {exc}") from None
+    raise _ShareError(f"{label}: {path} has loom.kind {kind!r}; "
+                      "expected 'dataframe', 'array', or 'scalar'")
+
+
+def _read_dataframe(label, table, frames, pa):
+    if frames == "polars":
+        return _share_module("polars", label).from_arrow(table)
+    pd = _share_module("pandas", label)
+    frame = table.to_pandas()
+    # pandas turns integer columns with missing values into float64 and
+    # boolean ones into object; the nullable dtypes keep the column's type.
+    nullable = {pa.int8(): pd.Int8Dtype(), pa.int16(): pd.Int16Dtype(),
+                pa.int32(): pd.Int32Dtype(), pa.int64(): pd.Int64Dtype(),
+                pa.uint8(): pd.UInt8Dtype(), pa.uint16(): pd.UInt16Dtype(),
+                pa.uint32(): pd.UInt32Dtype(), pa.uint64(): pd.UInt64Dtype(),
+                pa.bool_(): pd.BooleanDtype()}
+    for i, column in enumerate(table.columns):
+        if column.null_count and column.type in nullable:
+            frame.isetitem(i, column.to_pandas(types_mapper=nullable.get))
+    return frame
+
+
+def _read_array(label, table, meta, pa):
+    np = _share_module("numpy", label)
+    if table.column_names != ["values"]:
+        raise _ShareError(f"{label}: an array has one column named 'values', "
+                          f"not {table.column_names}")
+    try:
+        shape = json.loads(meta[b"loom.shape"])
+    except (KeyError, ValueError):
+        raise _ShareError(f"{label}: an array needs a JSON list in loom.shape") from None
+    if not (isinstance(shape, list)
+            and all(isinstance(d, int) and not isinstance(d, bool) and d >= 0 for d in shape)):
+        raise _ShareError(f"{label}: loom.shape {shape!r} is not a list of dimensions")
+    column = table.column(0)
+    if math.prod(shape) != len(column):
+        raise _ShareError(f"{label}: loom.shape {shape} does not match {len(column)} values")
+    if column.null_count:
+        raise _ShareError(f"{label}: the array has missing values, which arrays cannot hold")
+    t = column.type
+    if pa.types.is_integer(t) or pa.types.is_floating(t) or pa.types.is_boolean(t):
+        values = np.array(column.to_numpy())  # a writable copy
+    elif _is_text_type(pa, t):
+        values = np.array(column.to_pylist(), dtype=str)
+    else:
+        raise _ShareError(f"{label}: arrays of Arrow type {t} cannot be read")
+    # The elements are stored in column-major order.
+    return values.reshape(shape, order="F")
+
+
+def _read_scalar(label, table, pa):
+    if table.column_names != ["value"] or table.num_rows != 1:
+        raise _ShareError(f"{label}: a scalar has one column named 'value' and one row")
+    t = table.schema.field(0).type
+    value = table.column(0)[0]
+    if not value.is_valid:
+        raise _ShareError(f"{label}: the scalar is a missing value")
+    if not (pa.types.is_integer(t) or pa.types.is_floating(t) or pa.types.is_boolean(t)
+            or _is_text_type(pa, t)):
+        raise _ShareError(f"{label}: scalars of Arrow type {t} cannot be read")
+    return value.as_py()
+
+
+def _shared_kind(label, value):
+    """Which kind of shareable value `value` is; anything else is an error."""
+    pd = sys.modules.get("pandas")
+    if pd is not None and isinstance(value, pd.DataFrame):
+        return "pandas"
+    pl = sys.modules.get("polars")
+    if pl is not None and isinstance(value, pl.DataFrame):
+        return "polars"
+    np = sys.modules.get("numpy")
+    if np is not None and isinstance(value, np.ndarray):
+        return "array"
+    if np is not None and isinstance(value, (np.bool_, np.integer, np.floating, np.str_)):
+        return "numpy scalar"
+    if type(value) in (bool, int, float, str):
+        return "scalar"
+    what = "None" if value is None else f"a value of type {_type_name(value)}"
+    raise _ShareError(f"{label}: {what} cannot be shared; {_SHAREABLE}")
+
+
+def _shared_table(label, value):
+    """The Arrow table, with loom metadata, that stores `value`."""
+    kind = _shared_kind(label, value)
+    pa = _share_module("pyarrow", label)
+    try:
+        if kind == "pandas":
+            table = _frame_table(label, pa.Table.from_pandas(value, preserve_index=False), pa)
+            meta = {"loom.kind": "dataframe"}
+        elif kind == "polars":
+            table = _frame_table(label, value.to_arrow(), pa)
+            meta = {"loom.kind": "dataframe"}
+        elif kind == "array":
+            table = pa.table({"values": _array_values(label, value, pa)})
+            meta = {"loom.kind": "array",
+                    "loom.shape": json.dumps(list(value.shape), separators=(",", ":"))}
+        else:
+            table = pa.table({"value": _scalar_values(label, value, kind, pa)})
+            meta = {"loom.kind": "scalar"}
+    except _ShareError:
+        raise
+    except Exception as exc:
+        raise _ShareError(f"{label}: {type(exc).__name__}: {exc}") from None
+    # Replacing the metadata also drops pandas' own, so a file reads the same
+    # whichever language wrote it.
+    return table.replace_schema_metadata(meta)
+
+
+def _frame_table(label, table, pa):
+    """Check a data frame's column types and give text columns one Arrow type."""
+    columns = []
+    for field, column in zip(table.schema, table.columns):
+        t = field.type
+        if _is_text_type(pa, t):
+            column = column.cast(pa.string())
+        elif pa.types.is_dictionary(t):
+            if not _is_text_type(pa, t.value_type):
+                raise _ShareError(f"{label}: column '{field.name}' is a categorical with "
+                                  f"{t.value_type} categories; only text categories can be shared")
+            column = column.cast(pa.dictionary(pa.int32(), pa.string(), t.ordered))
+        elif pa.types.is_float16(t):
+            column = column.cast(pa.float64())
+        elif not (pa.types.is_integer(t) or pa.types.is_floating(t) or pa.types.is_boolean(t)
+                  or pa.types.is_date(t) or pa.types.is_timestamp(t) or pa.types.is_null(t)):
+            raise _ShareError(f"{label}: column '{field.name}' has type {t}, which cannot be "
+                              f"shared; {_COLUMN_TYPES}")
+        columns.append(column)
+    return pa.Table.from_arrays(columns, names=table.column_names)
+
+
+_INT64_MAX = 2 ** 63 - 1
+
+
+def _array_values(label, array, pa):
+    """The elements of a numpy array in column-major order, as an Arrow array."""
+    np = sys.modules["numpy"]
+    if isinstance(array, np.ma.MaskedArray):
+        if np.ma.is_masked(array):
+            raise _ShareError(f"{label}: the array has masked (missing) values, "
+                              "which arrays cannot hold")
+        array = np.ma.getdata(array)
+    dtype = array.dtype
+    flat = array.ravel(order="F")
+    if dtype.kind == "b":
+        return pa.array(flat, type=pa.bool_())
+    if dtype.kind in "iu":
+        if dtype.itemsize < 4:
+            return pa.array(flat.astype(np.int32), type=pa.int32())
+        if dtype == np.int32:
+            return pa.array(flat, type=pa.int32())
+        if dtype.kind == "u" and dtype.itemsize == 8 and flat.size and flat.max() > _INT64_MAX:
+            raise _ShareError(f"{label}: a uint64 value exceeds the int64 range")
+        return pa.array(flat.astype(np.int64), type=pa.int64())
+    if dtype.kind == "f":
+        if dtype.itemsize > 8:
+            raise _ShareError(f"{label}: {dtype} arrays cannot be shared without losing precision")
+        return pa.array(flat.astype(np.float64), type=pa.float64())
+    if dtype.kind in "UT":
+        values = flat.tolist()
+        if any(v is None or not isinstance(v, str) for v in values):
+            raise _ShareError(f"{label}: the array has missing values, which arrays cannot hold")
+        return pa.array(values, type=pa.string())
+    if dtype.kind == "O" and any(v is None for v in flat):
+        raise _ShareError(f"{label}: the array contains None; arrays cannot hold missing "
+                          "values, and arrays of dtype object cannot be shared")
+    raise _ShareError(f"{label}: numpy arrays of dtype {dtype} cannot be shared; {_SHAREABLE}")
+
+
+def _scalar_values(label, value, kind, pa):
+    if kind == "numpy scalar":
+        np = sys.modules["numpy"]
+        if isinstance(value, np.bool_):
+            return pa.array([bool(value)], type=pa.bool_())
+        if isinstance(value, np.integer):
+            narrow = value.dtype.itemsize < 4 or value.dtype == np.int32
+            target = pa.int32() if narrow else pa.int64()
+            value = int(value)
+            if value > _INT64_MAX:
+                raise _ShareError(f"{label}: {value} exceeds the int64 range")
+            return pa.array([value], type=target)
+        if isinstance(value, np.floating):
+            if value.dtype.itemsize > 8:
+                raise _ShareError(f"{label}: {value.dtype} cannot be shared without losing precision")
+            return pa.array([float(value)], type=pa.float64())
+        return pa.array([str(value)], type=pa.string())
+    if isinstance(value, bool):
+        return pa.array([value], type=pa.bool_())
+    if isinstance(value, int):
+        if not -_INT64_MAX - 1 <= value <= _INT64_MAX:
+            raise _ShareError(f"{label}: {value} exceeds the int64 range")
+        return pa.array([value], type=pa.int64())
+    if isinstance(value, float):
+        return pa.array([value], type=pa.float64())
+    return pa.array([value], type=pa.string())
+
+
+def _remove_files(paths):
+    for path in paths:
+        if os.path.exists(path):
+            os.remove(path)
+
+
+def _bind_imports(session, imports, frames):
+    """Bind every import in the session, or none; return error text or None."""
+    try:
+        with _USER_CODE:
+            values = [(name, _read_shared(name, path, frames)) for name, path in imports]
+    except _UserError as err:
+        return _format_exception(err.exc)
+    for name, value in values:
+        session.globals[name] = value
+    return None
+
+
+def _write_exports(session, names):
+    """Write each name's value to a new stream file: ([{name, file}], error text or None)."""
+    entries = []
+    try:
+        with _USER_CODE:
+            for name in names:
+                label = f"export '{name}'"
+                if name not in session.globals:
+                    raise _ShareError(f"{label}: name '{name}' is not defined")
+                table = _shared_table(label, session.globals[name])
+                ipc = _share_module("pyarrow.ipc", label)
+                path = _scratch_path("arrow")
+                entries.append({"name": name, "file": path})
+                with ipc.new_stream(path, table.schema) as writer:
+                    writer.write_table(table)
+    except _UserError as err:
+        _remove_files(e["file"] for e in entries)
+        return [], _format_exception(err.exc)
+    return entries, None
+
+
 # ── Requests ────────────────────────────────────────────────────────────────
 
 
@@ -754,6 +1302,10 @@ def _options(req):
     if fmt not in _IMAGE_FORMATS:
         raise _malformed(f"options 'fig-format' must be one of {', '.join(_IMAGE_FORMATS)}")
     parsed["fig-format"] = fmt
+    frames = options.get("dataframe", "pandas")
+    if frames not in ("pandas", "polars"):
+        raise _malformed("options 'dataframe' must be \"pandas\" or \"polars\"")
+    parsed["dataframe"] = frames
     return parsed
 
 
@@ -771,6 +1323,22 @@ def _location(req, prefix):
     return file, 1 if line is None else line
 
 
+def _shared_fields(req):
+    """The request's imports as (name, file) pairs, and its export names or None."""
+    imports = req.get("imports")
+    if imports is None:
+        imports = []
+    if not isinstance(imports, list) or not all(
+            isinstance(i, dict) and isinstance(i.get("name"), str)
+            and isinstance(i.get("file"), str) for i in imports):
+        raise _malformed("'imports' must be a list of {\"name\": ..., \"file\": ...} objects")
+    exports = req.get("exports")
+    if exports is not None and (not isinstance(exports, list)
+                                or not all(isinstance(n, str) for n in exports)):
+        raise _malformed("'exports' must be a list of names")
+    return [(i["name"], i["file"]) for i in imports], exports
+
+
 def _op_hello(req):
     return {"ok": True, "protocol": PROTOCOL_VERSION, "language": "python",
             "version": platform.python_version(), "pid": os.getpid()}
@@ -784,7 +1352,13 @@ def _op_reset(req):
         raise _malformed("'setup' must be a list of strings")
     session = _Session()
     _sessions[name] = session
-    outputs = _run_setup(session, setup)
+    _begin_request()
+    try:
+        outputs = _run_setup(session, setup)
+    finally:
+        interrupted = _end_request()
+    if interrupted and not outputs:
+        outputs = [{"type": "error", "text": _INTERRUPTED}]
     session.position = None if outputs else position
     return {"ok": True, "failed": bool(outputs), "outputs": outputs}
 
@@ -798,6 +1372,7 @@ def _op_exec(req):
         raise _malformed("'mode' must be \"block\" or \"inline\"")
     code = _string(req, "code")
     options = _options(req)
+    imports, exports = _shared_fields(req)
     filename, first_line = _location(req, "cell" if mode == "block" else "inline")
     session = _sessions.get(name)
     if session is None:
@@ -809,12 +1384,47 @@ def _op_exec(req):
                            f"request expects {_show_position(after)}")
     # Unknown until the cell completes: a kernel error leaves it null.
     session.position = None
-    if mode == "block":
-        failed, outputs = _exec_block(session, code, filename, first_line, options)
-    else:
-        failed, outputs = _exec_inline(session, code, filename, first_line)
+    # A shallow copy holds the old objects, so identities cannot be reused.
+    before = dict(session.globals)
+    exported = []
+    _begin_request()
+    try:
+        error = _bind_imports(session, imports, options["dataframe"]) if imports else None
+        if error is not None:
+            failed = True
+            outputs = [{"type": "error", "text": error}]
+            if mode == "block" and code:
+                outputs.insert(0, {"type": "source", "code": code})
+        elif mode == "block":
+            failed, outputs = _exec_block(session, code, filename, first_line, options)
+        else:
+            failed, outputs = _exec_inline(session, code, filename, first_line)
+        if exports and not failed:
+            exported, error = _write_exports(session, exports)
+            if error is not None:
+                failed = True
+                if mode == "inline":
+                    outputs = []
+                outputs.append({"type": "error", "text": error})
+    finally:
+        interrupted = _end_request()
+    if interrupted and not (outputs and _is_interrupted_error(outputs[-1])):
+        # Arrived after the last user code ran: the request still fails.
+        if mode == "inline":
+            outputs = []
+        outputs.append({"type": "error", "text": _INTERRUPTED})
+        failed = True
+    if failed:
+        _remove_files(e["file"] for e in exported)
+        exported = []
+    changed = _changed_names(before, session.globals)
+    packages = _PACKAGES.report()
     session.position = cell_id
-    return {"ok": True, "failed": failed, "outputs": outputs}
+    response = {"ok": True, "failed": failed, "outputs": outputs,
+                "changed": changed, "packages": packages}
+    if exports is not None:
+        response["exports"] = exported
+    return response
 
 
 def _op_shutdown(req):
@@ -937,6 +1547,7 @@ def main(argv=None):
     if os.name != "posix":
         sys.exit("the loom Python kernel requires a POSIX system")
     args = _parse_args(argv)
+    signal.signal(signal.SIGINT, _on_sigint)
     if not _process_exists(args.parent_pid):
         _log(f"parent process {args.parent_pid} does not exist; exiting")
         return 1
