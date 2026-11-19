@@ -11,6 +11,7 @@ fig-width = 7        # inches
 fig-height = 5       # inches
 fig-format = "svg"   # svg, png, or pdf
 fig-dpi = 300        # resolution of raster figures
+print-width = 80     # characters per line of printed output
 error = false        # true: errors are output instead of failures
 
 [julia]

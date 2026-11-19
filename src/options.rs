@@ -21,6 +21,7 @@ pub const EXEC_KEYS: &[&str] = &[
     "fig-height",
     "fig-format",
     "fig-dpi",
+    "print-width",
 ];
 
 const RENDER_KEYS: &[&str] = &[
@@ -55,6 +56,8 @@ pub struct CellOptions {
     pub fig_height: Option<f64>,
     pub fig_format: Option<FigFormat>,
     pub fig_dpi: Option<f64>,
+    /// Characters per line of printed values and text output.
+    pub print_width: Option<u32>,
 }
 
 impl CellOptions {
@@ -162,6 +165,7 @@ pub fn parse_options(lines: &[&str]) -> Result<CellOptions, String> {
             "fig-width" => opts.fig_width = Some(parse_positive(key, value)?),
             "fig-height" => opts.fig_height = Some(parse_positive(key, value)?),
             "fig-dpi" => opts.fig_dpi = Some(parse_positive(key, value)?),
+            "print-width" => opts.print_width = Some(parse_print_width(value)?),
             "fig-format" => {
                 opts.fig_format = Some(FigFormat::parse(text).ok_or_else(|| {
                     format!("option `fig-format` must be svg, png, or pdf, not `{value}`")
@@ -325,6 +329,17 @@ fn parse_positive(key: &str, value: &str) -> Result<f64, String> {
     }
 }
 
+/// Characters per line of printed output. Below 20 most printers give up
+/// on their layout; R refuses widths below 10.
+pub fn parse_print_width(value: &str) -> Result<u32, String> {
+    match value.parse::<u32>() {
+        Ok(n) if n >= 20 => Ok(n),
+        _ => Err(format!(
+            "option `print-width` must be an integer of at least 20, not `{value}`"
+        )),
+    }
+}
+
 /// Labels become Typst labels on the generated element; the prefix selects
 /// the element: `fig-` a figure, `tbl-` a table figure, `eq-` the markup
 /// produced by `output: asis` (typically an equation).
@@ -432,5 +447,14 @@ mod tests {
         let o = parse_options(&["#| import: wages, n_obs", "#| export: fit.table"]).unwrap();
         assert_eq!(o.imports, ["wages", "n_obs"]);
         assert_eq!(o.exports, ["fit.table"]);
+    }
+
+    #[test]
+    fn print_width_is_an_integer_of_at_least_20() {
+        let o = parse_options(&["#| print-width: 64"]).unwrap();
+        assert_eq!(o.print_width, Some(64));
+        assert!(o.exec_raw().contains_key("print-width"));
+        assert!(parse_options(&["#| print-width: 12"]).is_err());
+        assert!(parse_options(&["#| print-width: 7.5"]).is_err());
     }
 }

@@ -56,6 +56,7 @@ value of the wrong type, is an error that names the file and line.
     [`fig-width`, `fig-height`], [execution], [figure size in inches (7 by 5)],
     [`fig-format`], [execution], [`svg` (default), `png`, or `pdf`],
     [`fig-dpi`], [execution], [resolution of raster figures (300)],
+    [`print-width`], [execution], [characters per line of printed output (80)],
     [`echo`], [display], [show the code (`true`)],
     [`output`], [display], [`true`, `false`, or `asis` (output is Typst markup)],
     [`include`], [display], [`false` hides code and output; the cell still runs],
@@ -117,6 +118,16 @@ len(words)
 A value that can be shown as an image becomes a figure, and a value with a
 Typst representation becomes Typst content; @sec-figures and
 @sec-languages describe both.
+
+Printed text is laid out by the language itself, for a line of
+`print-width` characters (80 by default). Set it in `loom.toml` to the
+number of monospaced characters that fit your text column, so that tables
+and summaries are not wrapped by Typst; a cell can override it:
+
+```julia
+#| print-width: 40
+collect(1:30)'
+```
 
 == Inline code
 

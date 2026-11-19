@@ -1077,8 +1077,13 @@ field_options <- function(req) {
   if (!is_string(fmt) || !fmt %in% names(mime_types)) {
     protocol_error("option 'fig-format' must be one of svg, png, pdf")
   }
+  pw <- o[["print-width"]]
+  if (!is.numeric(pw) || length(pw) != 1L || !is.finite(pw) || pw < 20 ||
+      pw != round(pw)) {
+    protocol_error("option 'print-width' must be an integer of at least 20")
+  }
   list(width = number("fig-width"), height = number("fig-height"),
-       format = fmt, dpi = number("fig-dpi"))
+       format = fmt, dpi = number("fig-dpi"), print_width = as.integer(pw))
 }
 
 field_imports <- function(req) {
@@ -1136,6 +1141,8 @@ op_exec <- function(req) {
   mode <- field_string(req, "mode")
   code <- field_string(req, "code")
   opts <- field_options(req)
+  # Characters per line of printed output (the `print-width` option).
+  options(width = opts$print_width)
   where <- field_where(req)
   imports <- field_imports(req)
   exports <- field_exports(req)

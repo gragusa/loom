@@ -282,7 +282,10 @@ function apply_fig_defaults!(done::Set{String}, opts)
         push!(done, "Makie")
     end
     if !("CairoMakie" in done) && (CM = loaded_module("CairoMakie")) !== nothing
-        Base.invokelatest(CM.activate!; px_per_unit = opts["fig-dpi"] / UNITS_PER_INCH)
+        # `type` is passed too: activate! resets it to "png" otherwise, and a
+        # figure is shown only in the format CairoMakie is set to produce.
+        Base.invokelatest(CM.activate!; type = opts["fig-format"],
+                          px_per_unit = opts["fig-dpi"] / UNITS_PER_INCH)
         push!(done, "CairoMakie")
     end
     return nothing
@@ -351,8 +354,19 @@ const CURRENT = Ref{Union{Nothing,Capture}}(nothing)
 # module prefix, as they would at the REPL.
 const CURRENT_MODULE = Ref{Module}(Main)
 
+# Characters per line of printed output (the `print-width` option). Values
+# shown by the kernel use it as their display width; code that prints to
+# stdout sees it through `displaysize()`, which reads ENV["COLUMNS"].
+const PRINT_WIDTH = Ref(80)
+
+function set_print_width!(n::Integer)
+    PRINT_WIDTH[] = n
+    ENV["COLUMNS"] = string(n)
+    return nothing
+end
+
 function plain_repr(x)
-    ctx = (:limit => true, :displaysize => (40, 80), :color => false, :module => CURRENT_MODULE[])
+    ctx = (:limit => true, :displaysize => (40, PRINT_WIDTH[]), :color => false, :module => CURRENT_MODULE[])
     return Base.invokelatest(sprint, show, MIME("text/plain"), x; context = ctx)
 end
 
@@ -916,12 +930,15 @@ function handle_exec(req)
         "fig-height" => Float64(required(raw, "fig-height", Real)),
         "fig-format" => required(raw, "fig-format", String),
         "fig-dpi" => Float64(required(raw, "fig-dpi", Real)),
+        "print-width" => Int(required(raw, "print-width", Integer)),
     )
+    opts["print-width"] >= 20 || error("print-width must be at least 20")
     haskey(FORMAT_MIME, opts["fig-format"]) || error("unknown fig-format '$(opts["fig-format"])'")
     file = get(req, "file", "cell")
     line = get(req, "line", 1)
     sess = get(SESSIONS, name, nothing)
     sess === nothing || (CURRENT_MODULE[] = sess.mod)
+    set_print_width!(opts["print-width"])
     have = sess === nothing ? "<no session>" : something(sess.position, "null")
     if sess === nothing || sess.position != after
         return protocol_error("position mismatch: session '$name' is at $have, request expects $after")

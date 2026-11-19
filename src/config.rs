@@ -104,6 +104,8 @@ pub struct ExecuteDefaults {
     pub fig_height: f64,
     pub fig_format: FigFormat,
     pub fig_dpi: f64,
+    /// Characters per line of printed values and text output.
+    pub print_width: u32,
     pub error: bool,
 }
 
@@ -114,6 +116,7 @@ impl Default for ExecuteDefaults {
             fig_height: 5.0,
             fig_format: FigFormat::Svg,
             fig_dpi: 300.0,
+            print_width: 80,
             error: false,
         }
     }
@@ -217,6 +220,9 @@ impl Config {
         if !(e.fig_width > 0.0 && e.fig_height > 0.0 && e.fig_dpi > 0.0) {
             bail!("[execute] fig-width, fig-height and fig-dpi must be positive");
         }
+        if e.print_width < 20 {
+            bail!("[execute] print-width must be at least 20");
+        }
         Ok(())
     }
 
@@ -254,5 +260,15 @@ mod tests {
     fn unknown_keys_are_rejected() {
         assert!(toml::from_str::<Config>("[execute]\nfig_width = 5\n").is_err());
         assert!(toml::from_str::<Config>("julia_port = 2159\n").is_err());
+    }
+
+    #[test]
+    fn print_width_default_and_bound() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.execute.print_width, 80);
+        let cfg: Config = toml::from_str("[execute]\nprint-width = 68\n").unwrap();
+        assert_eq!(cfg.execute.print_width, 68);
+        let narrow: Config = toml::from_str("[execute]\nprint-width = 10\n").unwrap();
+        assert!(narrow.validate().is_err());
     }
 }

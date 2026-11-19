@@ -32,6 +32,8 @@ pub struct ExecOptions {
     pub fig_height: f64,
     pub fig_format: FigFormat,
     pub fig_dpi: f64,
+    /// Characters per line of printed values and text output.
+    pub print_width: u32,
     /// An error is expected output rather than a failure.
     pub error: bool,
 }
@@ -44,6 +46,7 @@ impl ExecOptions {
             fig_height: o.fig_height.unwrap_or(d.fig_height),
             fig_format: o.fig_format.unwrap_or(d.fig_format),
             fig_dpi: o.fig_dpi.unwrap_or(d.fig_dpi),
+            print_width: o.print_width.unwrap_or(d.print_width),
             error: o.error.unwrap_or(d.error),
         }
     }
@@ -55,18 +58,25 @@ impl ExecOptions {
             "fig-height": self.fig_height,
             "fig-format": self.fig_format.as_str(),
             "fig-dpi": self.fig_dpi,
+            "print-width": self.print_width,
         })
     }
 
     fn canonical(&self) -> String {
-        format!(
+        let mut s = format!(
             "fig-width={};fig-height={};fig-format={};fig-dpi={};error={}",
             self.fig_width,
             self.fig_height,
             self.fig_format.as_str(),
             self.fig_dpi,
             self.error
-        )
+        );
+        // The default width adds nothing, so keys computed before the option
+        // existed still match the results they name.
+        if self.print_width != 80 {
+            s.push_str(&format!(";print-width={}", self.print_width));
+        }
+        s
     }
 }
 
@@ -481,5 +491,18 @@ mod tests {
             ("b.typ", "```julia\nx\n```\n"),
         ]);
         assert_ne!(k[0], k[1]);
+    }
+
+    #[test]
+    fn default_print_width_leaves_existing_keys_unchanged() {
+        let (doc, _) = plan_for(&[("doc.typ", "```julia\nx = 1\n```\n")]);
+        let resolved = ExecOptions::resolve(&doc.cells[0], &ExecuteDefaults::default());
+        assert_eq!(resolved.print_width, 80);
+        let canonical = |w| ExecOptions { print_width: w, ..resolved.clone() }.canonical();
+        assert!(!canonical(80).contains("print-width"));
+        assert!(canonical(64).ends_with(";print-width=64"));
+        let base = keys(&[("doc.typ", "```julia\nx = 1\n```\n")]);
+        let narrow = keys(&[("doc.typ", "```julia\n#| print-width: 64\nx = 1\n```\n")]);
+        assert_ne!(base[0], narrow[0]);
     }
 }

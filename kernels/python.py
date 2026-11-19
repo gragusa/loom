@@ -448,6 +448,18 @@ def _install_backend(mpl):
     mpl.use("module://" + _BACKEND_MODULE)
 
 
+def _apply_print_width(width):
+    """Characters per line of printed output (the `print-width` option), for
+    shutil.get_terminal_size and for numpy and pandas when they are loaded."""
+    os.environ["COLUMNS"] = str(width)
+    np = sys.modules.get("numpy")
+    if np is not None:
+        np.set_printoptions(linewidth=width)
+    pd = sys.modules.get("pandas")
+    if pd is not None:
+        pd.set_option("display.width", width)
+
+
 def _prepare_matplotlib(options):
     """Apply the cell's figure options if matplotlib is loaded; report whether it is."""
     mpl = sys.modules.get("matplotlib")
@@ -677,6 +689,9 @@ class _Cell:
         try:
             with _USER_CODE:
                 self.prepare_matplotlib()
+                # Before every statement: numpy or pandas may be imported
+                # by the previous one.
+                _apply_print_width(self.options["print-width"])
                 if isinstance(stmt, ast.Expr):
                     code = session.compile(ast.Expression(body=stmt.value), filename, "eval")
                     value = eval(code, session.globals)
@@ -1302,6 +1317,10 @@ def _options(req):
     if fmt not in _IMAGE_FORMATS:
         raise _malformed(f"options 'fig-format' must be one of {', '.join(_IMAGE_FORMATS)}")
     parsed["fig-format"] = fmt
+    width = options.get("print-width")
+    if isinstance(width, bool) or not isinstance(width, int) or width < 20:
+        raise _malformed("options 'print-width' must be an integer of at least 20")
+    parsed["print-width"] = width
     frames = options.get("dataframe", "pandas")
     if frames not in ("pandas", "polars"):
         raise _malformed("options 'dataframe' must be \"pandas\" or \"polars\"")
