@@ -25,7 +25,7 @@
 #let _langs = ("julia", "r", "python")
 
 // Options that change execution; they must match the stored result.
-#let _exec-keys = ("session", "setup", "stateless", "import", "export", "error", "fig-width", "fig-height", "fig-format", "fig-dpi")
+#let _exec-keys = ("session", "setup", "stateless", "import", "export", "error", "fig-width", "fig-height", "fig-format", "fig-dpi", "print-width")
 
 // Text settings in effect where `#show: loom` was applied. Content produced
 // by a show rule on `raw` inherits raw's own text settings (monospace font,

@@ -8,6 +8,7 @@
 # fig-height = 5       # inches
 # fig-format = "svg"   # svg, png, or pdf
 # fig-dpi = 300        # raster resolution
+# print-width = 80     # characters per line of printed output
 # error = false        # true: an error is shown as output instead of failing the run
 
 # How each kernel is started: `command args... <kernel script> <kernel args>`.

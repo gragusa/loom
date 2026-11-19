@@ -108,7 +108,7 @@ becomes `null`, and the response carries one `error` output:
 ```json
 {"op": "exec", "token": "T", "session": "intro", "after": "abc123",
  "id": "def456", "mode": "block", "code": "x = 1\nx + 1",
- "options": {"fig-width": 7.0, "fig-height": 5.0, "fig-format": "svg", "fig-dpi": 300}}
+ "options": {"fig-width": 7.0, "fig-height": 5.0, "fig-format": "svg", "fig-dpi": 300, "print-width": 80}}
 ```
 
 - If the session does not exist, or its position is not equal to `after`,
@@ -126,10 +126,15 @@ becomes `null`, and the response carries one `error` output:
   packages" below. `failed` is `true` when the code raised an error; execution of the
   cell stops at that error, and the last output is an `error` output.
 
-`options` always contains these four keys; for Python it may also contain
+`options` always contains these five keys; for Python it may also contain
 `dataframe` (`"pandas"` or `"polars"`, see "Shared data"). `fig-width` and `fig-height` are in
-inches. `fig-format` is one of `svg`, `png`, `pdf`. `fig-dpi` applies to
-raster output.
+inches. `fig-format` is one of `svg`, `png`, `pdf`; a kernel produces a
+figure in that format when the plotting package can. `fig-dpi` applies to
+raster output. `print-width` (an integer, at least 20) is the number of
+characters per line of printed output: Julia uses it as the display width of
+values and sets `ENV["COLUMNS"]`; R sets `options(width =)`; Python sets
+`COLUMNS` and, when they are loaded, numpy's `linewidth` and pandas'
+`display.width`.
 
 `mode` is `block` or `inline`; see below.
 
