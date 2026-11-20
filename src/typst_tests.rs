@@ -244,8 +244,14 @@ fn editing_an_exporter_makes_its_importers_stale() {
     assert_eq!(statuses(&text), ["pending", "result 1", "stale", "result 2"]);
 }
 
-/// Compile a document whose every cell produced `images` SVG images.
-fn compile_with_images(doc: &str, images: usize, strict: bool) -> Result<String, String> {
+/// Write `doc` as the root file of a new project in which every cell
+/// produced `outputs` (figures 2in by 1in); image outputs may refer to
+/// `figures/box.svg`, a 100 by 60 SVG. Returns the project directory and the
+/// root file.
+fn project_with_outputs(
+    doc: &str,
+    outputs: &[serde_json::Value],
+) -> Result<(tempfile::TempDir, std::path::PathBuf), String> {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("doc.typ");
     std::fs::write(&root, doc).unwrap();
@@ -262,9 +268,6 @@ fn compile_with_images(doc: &str, images: usize, strict: bool) -> Result<String,
     let mut st = Store::default();
     for (i, key) in plan.cell_keys.iter().enumerate() {
         let Some(key) = key else { continue };
-        let outputs = (0..images)
-            .map(|_| serde_json::json!({"type": "display", "data": {"image/svg+xml": {"file": "figures/box.svg"}}}))
-            .collect();
         st.insert(
             key.clone(),
             Entry {
@@ -272,7 +275,7 @@ fn compile_with_images(doc: &str, images: usize, strict: bool) -> Result<String,
                 session: parsed.cells[i].session().into(),
                 failed: false,
                 error_ok: false,
-                outputs,
+                outputs: outputs.to_vec(),
                 exec: parsed.cells[i].options.exec_raw(),
                 fig_width: 2.0,
                 fig_height: 1.0,
@@ -283,6 +286,13 @@ fn compile_with_images(doc: &str, images: usize, strict: bool) -> Result<String,
         );
     }
     store::write_cells_json(&project, &parsed, &plan, &st).unwrap();
+    Ok((dir, root))
+}
+
+/// Compile a document whose every cell produced `images` SVG images.
+fn compile_with_images(doc: &str, images: usize, strict: bool) -> Result<String, String> {
+    let image = serde_json::json!({"type": "display", "data": {"image/svg+xml": {"file": "figures/box.svg"}}});
+    let (dir, root) = project_with_outputs(doc, &vec![image; images])?;
     let mut cmd = Command::new("typst");
     cmd.arg("compile");
     if strict {
@@ -334,4 +344,63 @@ fn a_subcaption_count_mismatch_fails_in_strict_mode() {
     assert!(err.contains("has 1 subcaptions for 2 images"), "{err}");
     let draft = compile_with_images(&doc, 2, false).unwrap();
     assert!(draft.contains("1 subcaptions for 2 images"), "{draft}");
+}
+
+/// Evaluate the Typst expression `expr` in the document `root` in strict
+/// mode and return what `typst eval` prints.
+fn typst_eval(root: &Path, expr: &str) -> String {
+    let out = Command::new("typst")
+        .args(["eval", "--input", "loom=strict", "--in"])
+        .arg(root)
+        .arg(expr)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn equations_and_figures_are_centered_on_pages_of_auto_width() {
+    if !typst_available() {
+        return;
+    }
+    // The widest line, 400pt after a 10pt margin, sets the page width. Only
+    // the `width: auto` page is measured: positions reported for content
+    // inside `layout` (as cell output is on a page of fixed width) are not
+    // where it is drawn.
+    let doc = |cells: &str| {
+        format!(
+            "#import \".loom/loom.typ\": loom\n\
+#set page(width: auto, height: auto, margin: 10pt)\n#show: loom\n\
+#box(width: 400pt)\n\n{cells}"
+        )
+    };
+
+    // A display equation from an `output: asis` cell, with markers at both
+    // ends of its math: centered, the gaps to either side of the column match.
+    let equation = serde_json::json!({"type": "value", "repl_only": false, "data": {
+        "text/x-string": "$ #[#metadata(none) <math-start>] x = 1 #[#metadata(none) <math-end>] $",
+        "text/plain": "x = 1"}});
+    let (_eq_dir, eq_root) = project_with_outputs(
+        &doc("```julia\n#| echo: false\n#| output: asis\nequation()\n```\n"),
+        &[equation],
+    )
+    .unwrap();
+    let gaps = typst_eval(
+        &eq_root,
+        "(locate(<math-start>).position().x.pt() - 10, 410 - locate(<math-end>).position().x.pt())",
+    );
+    let gaps: Vec<f64> = serde_json::from_str(&gaps).unwrap();
+    assert!(gaps[0] > 150.0 && (gaps[0] - gaps[1]).abs() < 0.01, "{gaps:?}");
+
+    // Images 2in wide, in figures with and without a caption, start at
+    // 10pt + (400pt - 144pt) / 2.
+    let image = serde_json::json!({"type": "display", "data": {"image/svg+xml": {"file": "figures/box.svg"}}});
+    let (_fig_dir, fig_root) = project_with_outputs(
+        &doc("```julia\n#| echo: false\nplot()\n```\n```julia\n#| echo: false\n#| fig-cap: Box.\nplot()\n```\n"),
+        &[image],
+    )
+    .unwrap();
+    let starts = typst_eval(&fig_root, "query(image).map(it => it.location().position().x.pt())");
+    assert_eq!(starts, "[138.0,138.0]");
 }

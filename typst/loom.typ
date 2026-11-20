@@ -181,8 +181,17 @@
   _echo(chunk, lang)
 }
 
-#let _box(s, body) = block(
-  width: 100%,
+// A block as wide as the region it sits in. In a region of unbounded width
+// (a page or container with `width: auto`), `width: 100%` would shrink the
+// block to its narrowest layout and break text at every space, so there the
+// block fits its content instead.
+#let _full-width(body, ..args) = layout(size => block(
+  width: if float.is-infinite(size.width.pt()) { auto } else { 100% },
+  ..args,
+  body,
+))
+
+#let _box(s, body) = _full-width(
   fill: s.fill,
   stroke: s.stroke,
   inset: s.inset,
@@ -446,6 +455,8 @@
     } else { body }
   }
 
+  // Each piece is `(framed: bool, body: content)`; framed pieces are the
+  // boxes of code, text output, and errors.
   let out = ()
   let last-image = pieces.enumerate().filter(((k, p)) => p.kind == "image").map(((k, p)) => k).at(-1, default: -1)
   let i = 0
@@ -459,25 +470,25 @@
         parts.push(if q.kind == "code" { _render-code(q, lang, s, style) } else { _render-text(q, s, style) })
         i += 1
       }
-      out.push(_box(style.code, stack(spacing: 0.5em, ..parts)))
+      out.push((framed: true, body: _box(style.code, stack(spacing: 0.5em, ..parts))))
       continue
     } else if p.kind == "code" {
-      out.push(_box(style.code, _render-code(p, lang, s, style)))
+      out.push((framed: true, body: _box(style.code, _render-code(p, lang, s, style))))
     } else if p.kind == "text" {
-      out.push(_box(style.output, _render-text(p, s, style)))
+      out.push((framed: true, body: _box(style.output, _render-text(p, s, style))))
     } else if p.kind == "error" {
-      out.push(_box(style.error, { set text(fill: style.error.color); raw(p.text, block: true) }))
+      out.push((framed: true, body: _box(style.error, { set text(fill: style.error.color); raw(p.text, block: true) })))
     } else if p.kind == "image" {
       // All images of a cell form one figure, placed after the code that
       // drew the last of them.
       if i == last-image {
-        out.push(column-hook(figure-of(images)))
+        out.push((framed: false, body: column-hook(figure-of(images))))
       }
     } else if p.kind == "typst" {
-      out.push(column-hook(table-of(p)))
+      out.push((framed: false, body: column-hook(table-of(p))))
     } else if p.kind == "markup" {
       let m = _eval-markup(p.text.trim(), cfg.scope)
-      out.push(if eq-label { [#m #std.label(label)] } else { m })
+      out.push((framed: false, body: if eq-label { [#m #std.label(label)] } else { m }))
     }
     i += 1
   }
@@ -486,9 +497,19 @@
     banner = [#banner #text(size: 0.75em, fill: rgb("#9a5b00"))[loom · #s.fig-subcap.len() subcaptions for #images.len() images]]
   }
   banner
-  // Full-width blocks: inside a `stack`, figures would shrink to their
-  // content and lose their centering.
-  out.map(x => block(width: 100%, spacing: style.spacing, x)).join()
+  // Each piece sits in an outer block that carries the spacing, which does
+  // not reach the flow from inside `layout`. On a page with `width: auto`
+  // a block is only as wide as its content, so a display equation or figure
+  // inside one would sit at the start of the page instead of being centered
+  // on it; there the pieces without a frame go into the flow unwrapped, and
+  // the block spacing they would have had is set on them instead.
+  let unbounded = page.width == auto
+  out.map(x => if x.framed or not unbounded {
+    block(spacing: style.spacing, _full-width(x.body))
+  } else {
+    set block(spacing: style.spacing)
+    x.body
+  }).join()
 }
 
 #let _render-cell(code, lang, o, entry, status, cfg) = _restore(_render-cell-content(code, lang, o, entry, status, cfg))
